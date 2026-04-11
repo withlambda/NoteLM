@@ -287,7 +287,8 @@ class VllmSettings(BaseSettings):
         vllm_temperature_text_chunk_correction (float): Temperature for text chunk correction.
         vllm_temperature_image_description (float): Temperature for image description generation.
         vllm_chunk_output_formatting_instruction (str): Formatting instruction for chunked output.
-        vllm_chunk_user_prompt_init (str): Initial prompt for chunked processing.
+        vllm_chunk_user_prompt_init_start (str): Initial start of user prompt for chunked processing.
+        vllm_chunk_user_prompt_init_end (str): Initial end of user prompt for chunked processing.
         vllm_chunk_structural_markdown_instructions (str): Structural Markdown instructions for chunked processing.
         vllm_image_description_output_formatting_instruction (str): Formatting instruction for image description output.
         vllm_output_json_schema (dict): JSON schema for the output format.
@@ -406,9 +407,14 @@ class VllmSettings(BaseSettings):
         validation_alias="NOTELM_VLLM_CHUNK_OUTPUT_FORMATTING_INSTRUCTION"
     )
 
-    vllm_chunk_user_prompt_init: str = Field(
+    vllm_chunk_user_prompt_init_start: str = Field(
         "### TEXT TO PROCESS:\n",
-        validation_alias="NOTELM_VLLM_CHUNK_USER_PROMPT_INIT"
+        validation_alias="NOTELM_VLLM_CHUNK_USER_PROMPT_INIT_START"
+    )
+
+    vllm_chunk_user_prompt_init_end: str = Field(
+        "\n### CORRECTED TEXT:",
+        validation_alias="NOTELM_VLLM_CHUNK_USER_PROMPT_INIT_END"
     )
 
     vllm_image_description_output_formatting_instruction: str = Field(

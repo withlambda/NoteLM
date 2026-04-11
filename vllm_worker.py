@@ -287,8 +287,7 @@ class VllmWorker:
         {self.settings.vllm_chunk_output_formatting_instruction}
         """
 
-        # Note r is ~ 1.3 since the JSON output yields ~30 % overhead to the pure text output.
-        effective_chunk_size: int = self._compute_effective_chunk_size(prompt_template, r=1.3)
+        effective_chunk_size: int = self._compute_effective_chunk_size(prompt_template, r=1)
         if effective_chunk_size <= 0:
             logger.error(
                 "Skipping OCR error correction: prompt token usage leaves no room "
@@ -476,7 +475,7 @@ class VllmWorker:
             The corrected text, or the original chunk as fallback on failure.
         """
 
-        user_prompt: str = f"{self.settings.vllm_chunk_user_prompt_init}{chunk}"
+        user_prompt: str = f"{self.settings.vllm_chunk_user_prompt_init_start}{chunk}{self.settings.vllm_chunk_user_prompt_init_end}"
 
         max_completion_tokens = self._compute_max_completion_tokens(
             self._count_tokens(system_prompt, user_prompt)
@@ -499,15 +498,23 @@ class VllmWorker:
                         ChatCompletionUserMessageParam(role="user", content=user_prompt),
                     ],
                     max_tokens=max_completion_tokens,
+                    top_p=1.0,
                     # 1. Force temperature to 0 for deterministic OCR correction
                     temperature=self.settings.vllm_temperature_text_chunk_correction,
                     # 2. This is the vLLM "magic" that prevents chatter
                     extra_body={
-                        "guided_json": self.settings.vllm_output_json_schema
-                    }
+                        "top_k": -1
+                    },
+                    # We use "### TEXT TO PROCESS:" as a stop sequence because if the
+                    # model tries to repeat the prompt or start a new batch, it stops.
+                    stop=[
+                        f"{self.settings.vllm_chunk_user_prompt_init_start.replace("\n", "")}",
+                        "Note:",
+                        "\n\n\n\n"
+                    ]
                 )
 
-                content = self.extract_ocr_text(response.choices[0].message.content)
+                content = response.choices[0].message.content
 
                 return content if content else chunk
 
@@ -560,7 +567,7 @@ class VllmWorker:
             raise ValueError("Output-to-input token ratio 'r' must be non-negative.")
 
         system_prompt_tokens = self._count_tokens(system_prompt)
-        user_prompt_introduction = self._count_tokens(self.settings.vllm_chunk_user_prompt_init)
+        user_prompt_introduction = self._count_tokens(self.settings.vllm_chunk_user_prompt_init_start, self.settings.vllm_chunk_user_prompt_init_end)
         context_budget = (
             self.settings.vllm_max_model_len
             - system_prompt_tokens
