@@ -14,151 +14,366 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Script to run local tests for the Dockerized Marker-PDF solution (RunPod Serverless).
-#
-# This script performs the following actions:
-# 1. Sets up a build test directory and copies necessary files.
-# 2. Generates sample PDF files for testing if they don't exist.
-# 3. Builds the Docker image.
-# 4. Runs the Docker container with the test handler and mounted volumes.
-# 5. Verifies that Markdown output files are generated.
-#
-# Prerequisites:
-# - Docker installed and running.
-# - Python 3 installed.
-# - Access to vLLM-compatible models and Marker models (mounted via volumes).
+# Single-entry Docker validation workflow:
+# - one image build
+# - one container run
+# - staged in-container validation with persisted host-visible results
 
-set -e
+set -euo pipefail
 
-# --- Configuration ---
-
-# set variables
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PARENT_OF_SCRIPT_DIR=$(dirname -- "${SCRIPT_DIR}")
+PROJECT_ROOT=$(dirname -- "${SCRIPT_DIR}")
 
-BUILD_TEST_DIR="${PARENT_OF_SCRIPT_DIR}/build/test"
-export TEST_INPUT_DIR="${BUILD_TEST_DIR}/test-data/input"
-export TEST_OUTPUT_DIR="${BUILD_TEST_DIR}/test-data/output"
+BUILD_TEST_DIR="${PROJECT_ROOT}/build/test"
+TEST_INPUT_DIR="${BUILD_TEST_DIR}/test-data/input"
+TEST_OUTPUT_DIR="${BUILD_TEST_DIR}/test-data/output"
+RESULTS_DIR="${BUILD_TEST_DIR}/results"
+STAGES_DIR="${RESULTS_DIR}/stages"
 
-DOCKER_CONTAINER="marker-with-vllm-test"
+DOCKER_IMAGE_NAME="${DOCKER_IMAGE_NAME:-notelm-migrate-validation}"
+DOCKER_CONTAINER_NAME="${DOCKER_CONTAINER_NAME:-notelm-migrate-validation-run}"
+VALIDATE_DEBUG_TRUE="${VALIDATE_DEBUG_TRUE:-0}"
 
-rm -rf "${BUILD_TEST_DIR}" && mkdir -p "${BUILD_TEST_DIR}"
+write_build_failure_summary() {
+  python3 - "${RESULTS_DIR}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+results_dir = Path(sys.argv[1])
+summary = {
+    "workflow": "docker-single-run-validation",
+    "workflow_started_at": now(),
+    "workflow_finished_at": now(),
+    "final_exit_code": 1,
+    "stage_order": [
+        "build",
+        "debug-deps-default",
+        "deps",
+        "cli-smoke",
+        "server-readiness",
+        "e2e-output",
+        "runtime-assets",
+        "debug-deps-true",
+    ],
+    "stages": [
+        {
+            "stage_id": "build",
+            "description": "Build Docker image once",
+            "status": "failed",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/build.log",
+            "details": {
+                "reason": "docker_build_failed"
+            }
+        },
+        {
+            "stage_id": "debug-deps-default",
+            "description": "Verify debug-gated dependency behavior with default DEBUG=false",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/debug-deps-default.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "deps",
+            "description": "Run runtime dependency sanity checks",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/deps.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "cli-smoke",
+            "description": "Run MinerU/vLLM CLI smoke checks",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/cli-smoke.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "server-readiness",
+            "description": "Start vLLM serving path and verify readiness endpoints",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/server-readiness.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "e2e-output",
+            "description": "Execute NoteLM handler sample flow and verify markdown output",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/e2e-output.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "runtime-assets",
+            "description": "Confirm required runtime model/assets are present",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/runtime-assets.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        },
+        {
+            "stage_id": "debug-deps-true",
+            "description": "Optional DEBUG=true dependency check path",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/debug-deps-true.log",
+            "details": {
+                "reason": "build_failed"
+            }
+        }
+    ]
+}
+
+(results_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+write_missing_summary_fallback() {
+  local container_exit_code="$1"
+  python3 - "${RESULTS_DIR}" "${container_exit_code}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+results_dir = Path(sys.argv[1])
+container_exit_code = int(sys.argv[2])
+summary = {
+    "workflow": "docker-single-run-validation",
+    "workflow_started_at": now(),
+    "workflow_finished_at": now(),
+    "final_exit_code": 1,
+    "stage_order": [
+        "debug-deps-default",
+        "deps",
+        "cli-smoke",
+        "server-readiness",
+        "e2e-output",
+        "runtime-assets",
+        "debug-deps-true",
+    ],
+    "stages": [
+        {
+            "stage_id": "debug-deps-default",
+            "description": "Verify debug-gated dependency behavior with default DEBUG=false",
+            "status": "failed",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/container-run.log",
+            "details": {
+                "reason": "container_failed_before_summary",
+                "container_exit_code": container_exit_code
+            }
+        },
+        {
+            "stage_id": "deps",
+            "description": "Run runtime dependency sanity checks",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/deps.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        },
+        {
+            "stage_id": "cli-smoke",
+            "description": "Run MinerU/vLLM CLI smoke checks",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/cli-smoke.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        },
+        {
+            "stage_id": "server-readiness",
+            "description": "Start vLLM serving path and verify readiness endpoints",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/server-readiness.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        },
+        {
+            "stage_id": "e2e-output",
+            "description": "Execute NoteLM handler sample flow and verify markdown output",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/e2e-output.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        },
+        {
+            "stage_id": "runtime-assets",
+            "description": "Confirm required runtime model/assets are present",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/runtime-assets.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        },
+        {
+            "stage_id": "debug-deps-true",
+            "description": "Optional DEBUG=true dependency check path",
+            "status": "skipped",
+            "started_at": now(),
+            "finished_at": now(),
+            "duration_seconds": 0.0,
+            "log": "stages/debug-deps-true.log",
+            "details": {
+                "reason": "container_failed_before_summary"
+            }
+        }
+    ]
+}
+
+(results_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+echo "Preparing build workspace at ${BUILD_TEST_DIR}"
+rm -rf "${BUILD_TEST_DIR}"
+mkdir -p "${TEST_INPUT_DIR}" "${TEST_OUTPUT_DIR}" "${STAGES_DIR}"
 
 cp "${SCRIPT_DIR}"/*.txt \
   "${SCRIPT_DIR}"/*.py \
   "${SCRIPT_DIR}"/*.env \
   "${SCRIPT_DIR}/.dockerignore" \
-  "${PARENT_OF_SCRIPT_DIR}/Dockerfile" \
-  "${PARENT_OF_SCRIPT_DIR}/requirements.txt" \
-  "${PARENT_OF_SCRIPT_DIR}/handler.py" \
-  "${PARENT_OF_SCRIPT_DIR}/vllm_worker.py" \
-  "${PARENT_OF_SCRIPT_DIR}/utils.py" \
-  "${PARENT_OF_SCRIPT_DIR}/settings.py" \
-  "${PARENT_OF_SCRIPT_DIR}/check_dependencies.py" \
-  "${PARENT_OF_SCRIPT_DIR}/block_correction_prompts.json" "${BUILD_TEST_DIR}"
+  "${PROJECT_ROOT}/Dockerfile" \
+  "${PROJECT_ROOT}/requirements.txt" \
+  "${PROJECT_ROOT}/handler.py" \
+  "${PROJECT_ROOT}/vllm_worker.py" \
+  "${PROJECT_ROOT}/vllm_server.py" \
+  "${PROJECT_ROOT}/utils.py" \
+  "${PROJECT_ROOT}/settings.py" \
+  "${PROJECT_ROOT}/check_dependencies.py" \
+  "${PROJECT_ROOT}/debug_dependencies.py" \
+  "${PROJECT_ROOT}/mineru.json" \
+  "${PROJECT_ROOT}/block_correction_prompts.json" \
+  "${BUILD_TEST_DIR}"
+
+chmod -R a+rwx "${BUILD_TEST_DIR}/test-data" "${RESULTS_DIR}"
 
 cd "${BUILD_TEST_DIR}" || exit 1
 
-pip install -r requirements-setup.txt
-
-rm -rf "${TEST_INPUT_DIR}"
-rm -rf "${TEST_OUTPUT_DIR}"
-
-mkdir -p "${TEST_INPUT_DIR}"
-mkdir -p "${TEST_OUTPUT_DIR}"
-
-# --- 1. Check for Sample PDFs ---
-
-echo "Checking for sample PDFs in ${TEST_INPUT_DIR}..."
-
-if [ ! -d "${TEST_INPUT_DIR}" ] || [ -z "$(ls -A "${TEST_INPUT_DIR}")" ]; then
-    echo "Sample PDFs not found. Generating them..."
-    if ! python3 create-sample-pdfs.py; then
-        echo "Error: Failed to generate sample PDFs."
-        exit 1
-    fi
-else
-    echo "Sample PDFs found."
-fi
-
-# --- 2. Build Docker Image ---
-
-echo "Building Docker image..."
-
-docker_build_cmd=()
-docker_build_cmd+=("docker build")
-docker_build_cmd+=("-f Dockerfile")
-docker_build_cmd+=("-t ${DOCKER_CONTAINER}")
-docker_build_cmd+=(".")
-
-echo "Docker build command:"
-echo "${docker_build_cmd[*]}"
-
-# shellcheck disable=SC2068
-if ! ${docker_build_cmd[@]}
+if ! python3 -c "import reportlab" >/dev/null 2>&1
 then
-    echo "Error: Failed to build Docker image."
-    exit 1
+  python3 -m pip install -r requirements-setup.txt
 fi
 
-# --- 3. Run Container & Test Handler ---
+echo "Generating sample PDFs into ${TEST_INPUT_DIR}"
+python3 create-sample-pdfs.py
 
-echo "Running container and executing test handler..."
+BUILD_LOG="${STAGES_DIR}/build.log"
+CONTAINER_RUN_LOG="${STAGES_DIR}/container-run.log"
 
-docker_run_cmd=()
+docker_build_cmd=(
+  docker build
+  -f Dockerfile
+  -t "${DOCKER_IMAGE_NAME}"
+  .
+)
 
-docker_run_cmd+=("docker run --rm")
-docker_run_cmd+=("--name ${DOCKER_CONTAINER}")
-docker_run_cmd+=("--shm-size=4gb")
-docker_run_cmd+=("--env-file custom.env")
-docker_run_cmd+=("--env-file marker.env")
-#docker_run_cmd+=("--env-file surya.env")
-docker_run_cmd+=("--env-file tools.env")
-docker_run_cmd+=("-e STRICT_MODE=True")
-#docker_run_cmd+=("-v /path/to/model/weights:/v/models")
-docker_run_cmd+=("-v ${PARENT_OF_SCRIPT_DIR}/models/huggingface:/v/huggingface-cache")
-docker_run_cmd+=("-v ${PARENT_OF_SCRIPT_DIR}/models/datalab:/app/cache/datalab")
-docker_run_cmd+=("-v ${TEST_INPUT_DIR}:/v/input")
-docker_run_cmd+=("-v ${TEST_OUTPUT_DIR}:/v/output")
-docker_run_cmd+=("-it")
-docker_run_cmd+=("${DOCKER_CONTAINER}")
-
-echo "Docker run command:"
-echo "${docker_run_cmd[*]}"
-
-# Debug: Inspect the directory structure of the mounted cache BEFORE running the handler
-# This helps confirm if the paths expected by Marker match what is mounted.
-#"${docker_run_cmd[@]:0:${#docker_run_cmd[@]}-1}" "${DOCKER_CONTAINER}" ls -R /app/cache/datalab | head -n 30
-
-# shellcheck disable=SC2068
-${docker_run_cmd[@]}
-
-EXIT_CODE=$?
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "Error: Container exited with non-zero status."
-    # Don't exit immediately, check output first.
+echo "Docker build command: ${docker_build_cmd[*]}"
+if ! "${docker_build_cmd[@]}" 2>&1 | tee "${BUILD_LOG}"
+then
+  echo "Docker build failed. Writing summary artifact before exit."
+  write_build_failure_summary
+  exit 1
 fi
 
-# --- 4. Verify Output ---
+docker_run_cmd=(
+  docker run --rm
+  --name "${DOCKER_CONTAINER_NAME}"
+  --shm-size=4gb
+  --env-file custom.env
+  --env-file mineru.env
+  --env-file tools.env
+  -e STRICT_MODE=True
+  -e DEBUG=false
+  -e VALIDATE_DEBUG_TRUE="${VALIDATE_DEBUG_TRUE}"
+  -e VALIDATION_RESULTS_DIR=/v/results
+  -v "${PROJECT_ROOT}/models/huggingface:/v/huggingface-cache"
+  -v "${PROJECT_ROOT}/models/datalab:/app/cache/datalab"
+  -v "${TEST_INPUT_DIR}:/v/input"
+  -v "${TEST_OUTPUT_DIR}:/v/output"
+  -v "${RESULTS_DIR}:/v/results"
+  "${DOCKER_IMAGE_NAME}"
+  python3 -u docker_validation_workflow.py
+)
 
-echo "Verifying output in ${TEST_OUTPUT_DIR}..."
+echo "Docker run command: ${docker_run_cmd[*]}"
+set +e
+"${docker_run_cmd[@]}" 2>&1 | tee "${CONTAINER_RUN_LOG}"
+CONTAINER_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
-# Check if output directory exists
-if [ ! -d "${TEST_OUTPUT_DIR}" ]; then
-    echo "Error: Output directory not found."
-    exit 1
+if [ ! -f "${RESULTS_DIR}/summary.json" ]
+then
+  echo "Container ended without summary.json; writing fallback summary."
+  write_missing_summary_fallback "${CONTAINER_EXIT_CODE}"
 fi
 
-# Check for Markdown files
-MD_FILES=$(find "${TEST_OUTPUT_DIR}" -name "*.md")
+echo "Validation results written to ${RESULTS_DIR}"
+echo "Summary: ${RESULTS_DIR}/summary.json"
 
-if [ -z "${MD_FILES}" ]; then
-    echo "FAILURE: No Markdown files generated."
-    exit 1
-else
-    echo "SUCCESS: Markdown files generated:"
-    echo "${MD_FILES}"
+if [ "${CONTAINER_EXIT_CODE}" -ne 0 ]
+then
+  echo "Docker validation failed with exit code ${CONTAINER_EXIT_CODE}."
+  exit "${CONTAINER_EXIT_CODE}"
 fi
 
-echo "Test completed successfully."
-exit 0
+echo "Docker validation completed successfully."

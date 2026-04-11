@@ -13,17 +13,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# 1. ARG SETUP
-ARG PYTORCH_VERSION=2.10.0
-ARG CUDA_VERSION=12.8
-ARG CUDNN_VERSION=9
-ARG DOWNLOAD_MARKER_MODELS="false"
-ARG BASE_IMAGE=pytorch/pytorch:${PYTORCH_VERSION}-cuda${CUDA_VERSION}-cudnn${CUDNN_VERSION}-runtime
-
-# 2. BASE IMAGE
-FROM ${BASE_IMAGE}
-
-ARG DOWNLOAD_MARKER_MODELS
+# 1. BASE IMAGE
+FROM vllm/vllm-openai:v0.18.0
 
 # 3. ENVIRONMENT SETTINGS
 # -- Redirect caches so non-root user can read models downloaded by root --
@@ -50,7 +41,7 @@ ARG DOWNLOAD_MARKER_MODELS
 # MKL_DYNAMIC=FALSE
 # OMP_DYNAMIC=FALSE
 #
-# --- Fix for Sequential GPU Workflows (Marker -> vLLM) ---
+# --- Fix for Sequential GPU Workflows (MinerU -> vLLM) ---
 #
 # PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 #
@@ -60,6 +51,7 @@ ARG DOWNLOAD_MARKER_MODELS
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    PIP_NO_INPUT=1 \
     XDG_CACHE_HOME=/app/cache \
     TORCH_HOME=/app/cache/torch \
     CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -73,41 +65,38 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NUMEXPR_NUM_THREADS=1 \
     CC=/usr/bin/gcc \
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-    NCCL_P2P_DISABLE=1
+    NCCL_P2P_DISABLE=1 \
+    MINERU_TOOLS_CONFIG_JSON="/app/mineru.json" \
+    MINERU_TOOLS_CONFIG_PATH="/app/mineru.json" \
+    DEBUG=false \
+    HANDLER_FILE_NAME="handler.py"
 
 # 5. APPLICATION SETUP
 WORKDIR /app
-COPY requirements.txt check_dependencies.py ./
+COPY requirements.txt ./
 
 RUN mkdir -p ${XDG_CACHE_HOME} && \
     apt-get update \
     && apt-get install -y \
-    poppler-utils \
-    tesseract-ocr \
-    curl \
-    zstd \
-    gcc \
-    g++ \
-    python3-dev \
-    gosu \
-    && pip install --no-cache-dir --break-system-packages pip  \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fontconfig \
+        libgl1 \
     && pip install --no-cache-dir --break-system-packages --use-deprecated=legacy-resolver -r requirements.txt \
-    && python3 check_dependencies.py \
-    && python3 -c "from marker.util import assign_config, download_font; download_font();" \
-    && if [ "${DOWNLOAD_MARKER_MODELS}" = "true" ]; then \
-    	python3 -c "from marker.models import create_model_dict; create_model_dict()"; \
-    fi \
+    && huggingface-cli download opendatalab/MinerU2.5-2509-1.2B --local-dir /app/models/mineru/vlm \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY *.py block_correction_prompts.json ./
+
+COPY *.py block_correction_prompts.json mineru.json ./
 
 # 8. Create Non-Root User (UID 1001) with the name appuser
 # Ensure appuser owns the app and cache
-RUN	groupadd -r appgroup && useradd -r -g appgroup -u 1001 -m -d /home/appuser appuser && \
+RUN groupadd -r appgroup && useradd -r -g appgroup -u 1001 -m -d /home/appuser appuser && \
     chown -R appuser:appgroup /app /home/appuser
 
-ENV HANDLER_FILE_NAME="handler.py"
+# 9. Run as non-root user
+USER appuser
 
-# 9. START COMMAND
+# 10. START COMMAND
 CMD python3 -u  "${HANDLER_FILE_NAME}"
