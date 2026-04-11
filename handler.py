@@ -502,7 +502,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         sys.executable,
         "-m",
         "mineru.cli.vlm_server",
-        "openai_server",
         "--engine",
         "vllm",
         "--host",

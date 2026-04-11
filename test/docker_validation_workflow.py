@@ -112,7 +112,7 @@ def run_cli_smoke_stage(context: ValidationContext, log_path: Path) -> tuple[boo
     del context
     commands = [
         [sys.executable, "-m", "mineru.cli.client", "--help"],
-        [sys.executable, "-m", "mineru.cli.vlm_server", "openai_server", "--help"],
+        [sys.executable, "-m", "mineru.cli.vlm_server", "--help"],
         ["mineru-api", "--help"],
         ["mineru-openai-server", "--help"],
     ]
@@ -148,7 +148,6 @@ def run_server_readiness_stage(context: ValidationContext, log_path: Path) -> tu
         sys.executable,
         "-m",
         "mineru.cli.vlm_server",
-        "openai_server",
         "--served-model-name",
         served_model_name,
         "--host",

@@ -268,6 +268,7 @@ class TestHandlerOrchestration(unittest.TestCase):
             self.assertIn(("stop", "mineru_parse"), manager_calls)
             parse_config = manager._configs["mineru_parse"]
             self.assertIn("mineru.cli.vlm_server", parse_config.command)
+            self.assertNotIn("openai_server", parse_config.command)
             self.assertNotIn("mineru-api", parse_config.command)
             self.assertEqual(parse_config.environment["MINERU_MODEL_SOURCE"], "local")
             self.assertEqual(parse_config.environment["MINERU_VL_MODEL_NAME"], "opendatalab/MinerU2.5-2509-1.2B")
