@@ -89,8 +89,7 @@ def run_debug_dependency_default_stage(context: ValidationContext, log_path: Pat
     command = [
         sys.executable,
         "-c",
-        "from debug_dependencies import run_debug_dependency_check_if_enabled;
-        run_debug_dependency_check_if_enabled()",
+        "from debug_dependencies import run_debug_dependency_check_if_enabled; run_debug_dependency_check_if_enabled()",
     ]
     command_exit = run_command(command, log_path, env_override={"DEBUG": "false"})
     success = debug_default_ok and command_exit == 0
@@ -288,8 +287,7 @@ def run_debug_dependency_true_stage(context: ValidationContext, log_path: Path) 
     command = [
         sys.executable,
         "-c",
-        "from debug_dependencies import run_debug_dependency_check_if_enabled;
-        run_debug_dependency_check_if_enabled()",
+        "from debug_dependencies import run_debug_dependency_check_if_enabled; run_debug_dependency_check_if_enabled()",
     ]
     command_exit = run_command(command, log_path, env_override={"DEBUG": "true"})
     return command_exit == 0, {
