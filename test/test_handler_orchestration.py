@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -438,6 +439,33 @@ class TestHandlerOrchestration(unittest.TestCase):
                     handler.handler(job)
         finally:
             tmpdir.cleanup()
+
+    def test_run_async_function_sync_without_running_loop(self):
+        async def _compute(value: int) -> int:
+            return value * 2
+
+        result = handler.run_async_function_sync(_compute, 21)
+        self.assertEqual(result, 42)
+
+    def test_run_async_function_sync_with_running_loop(self):
+        async def _compute(value: int) -> int:
+            return value + 1
+
+        async def _invoke() -> int:
+            return handler.run_async_function_sync(_compute, 41)
+
+        result = asyncio.run(_invoke())
+        self.assertEqual(result, 42)
+
+    def test_run_async_function_sync_propagates_exceptions_from_running_loop(self):
+        async def _explode() -> None:
+            raise RuntimeError("async explode")
+
+        async def _invoke() -> None:
+            with self.assertRaisesRegex(RuntimeError, "async explode"):
+                handler.run_async_function_sync(_explode)
+
+        asyncio.run(_invoke())
 
 
 if __name__ == "__main__":

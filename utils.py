@@ -19,13 +19,15 @@ Includes environment configuration, resource management (VRAM),
 and path validation utilities.
 """
 
+import asyncio
 import logging
 import math
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
-from typing import Any, Dict, Union, Optional
+from typing import Any, Dict, Union, Optional, Callable, Coroutine
 
 from PIL import Image
 from huggingface_hub import try_to_load_from_cache, _CACHED_NO_EXIST
@@ -76,6 +78,43 @@ def setup_config() -> GlobalConfig:
             )
 
     return config
+
+
+def run_async_function_sync(
+    async_callable: Callable[..., Coroutine[Any, Any, Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """
+    Executes an async callable from synchronous code.
+
+    If no event loop is running in the current thread, this uses ``asyncio.run``.
+    If an event loop is already running, execution is delegated to a dedicated
+    thread that owns its own event loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(async_callable(*args, **kwargs))
+
+    result_holder: Dict[str, Any] = {}
+    error_holder: Dict[str, BaseException] = {}
+
+    def _thread_target() -> None:
+        try:
+            result_holder["value"] = asyncio.run(async_callable(*args, **kwargs))
+        except BaseException as exc:
+            logger.exception("Async execution failed in dedicated thread.")
+            error_holder["error"] = exc
+
+    thread = threading.Thread(target=_thread_target)
+    thread.start()
+    thread.join()
+
+    if "error" in error_holder:
+        raise error_holder["error"]
+
+    return result_holder.get("value")
 
 def _update_ownership(*paths: str) -> None:
     """
