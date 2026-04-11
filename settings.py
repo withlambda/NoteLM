@@ -428,7 +428,6 @@ class VllmSettings(BaseSettings):
     vllm_chunk_structural_markdown_instructions: str = Field(
         """
         Structural & Markdown Rules:
-            - Table Restoration: Reconstruct fragments of Markdown tables (pipes | and dashes --). Merge rows that were split across lines and ensure logical alignment.
             - Metadata Preservation:
                 - Do NOT alter page markers like {0}-----------------
                 - Keep image syntax like ![](_page_1_Picture_5.jpeg) exactly as is.

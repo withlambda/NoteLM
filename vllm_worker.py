@@ -279,12 +279,8 @@ class VllmWorker:
         # to make sure the llm really uses the appropriate formatting
         # and does not forget about it.
         prompt_template = f"""
-        {self.settings.vllm_chunk_output_formatting_instruction}
-
         {prompt_template}
         {self.settings.vllm_chunk_structural_markdown_instructions}
-
-        {self.settings.vllm_chunk_output_formatting_instruction}
         """
 
         effective_chunk_size: int = self._compute_effective_chunk_size(prompt_template, r=1)
