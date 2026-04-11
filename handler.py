@@ -4,7 +4,6 @@ Orchestrates the conversion of documents using the MinerU library and
 optional post-processing using a vLLM-powered LLM server.
 """
 
-import asyncio
 import gc
 import logging
 import os
@@ -35,7 +34,8 @@ from utils import (
     clear_directory,
     setup_config,
     log_vram_usage,
-    LanguageProcessor
+    LanguageProcessor,
+    run_async_function_sync,
 )
 from vllm_server import VllmServerManager, VllmServerRoleConfig
 from debug_dependencies import run_debug_dependency_check_if_enabled
@@ -380,6 +380,7 @@ def extract_mineru_settings_from_job_input(job_input: Dict[str, Any]) -> MinerUS
     mineru_input["output_format"] = job_input.get("output_format", "markdown")
     return MinerUSettings(**mineru_input)
 
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     RunPod Serverless Handler for document conversion using MinerU and vLLM.
@@ -549,21 +550,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         start_page, end_page = _parse_mineru_page_range(mineru_settings.page_range)
-        asyncio.run(
-            run_orchestrated_cli(
-                input_path=input_path,
-                output_dir=output_path,
-                method=mineru_settings.ocr_mode,
-                backend=mineru_settings.backend,
-                lang=mineru_settings.doc_language,
-                server_url=mineru_settings.server_url,
-                api_url=mineru_settings.api_url,
-                start_page_id=start_page,
-                end_page_id=end_page,
-                formula_enable=True,
-                table_enable=True,
-                extra_cli_args=(),
-            )
+        run_async_function_sync(
+            run_orchestrated_cli,
+            input_path=input_path,
+            output_dir=output_path,
+            method=mineru_settings.ocr_mode,
+            backend=mineru_settings.backend,
+            lang=mineru_settings.doc_language,
+            server_url=mineru_settings.server_url,
+            api_url=mineru_settings.api_url,
+            start_page_id=start_page,
+            end_page_id=end_page,
+            formula_enable=True,
+            table_enable=True,
+            extra_cli_args=(),
         )
 
         for file_to_process in files_to_process:
