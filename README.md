@@ -7,7 +7,7 @@ This project provides a Dockerized solution for running `MinerU` with `vLLM` LLM
 ## Architecture
 
 The container runs a Python handler script that listens for jobs from the RunPod API. When a job is received, it:
-1.  **MinerU Parse Phase**: Starts a MinerU OpenAI-compatible parse server (`mineru.cli.vlm_server openai_server`), waits for readiness (`/health` + served-model check), then calls MinerU's HTTP client path (`backend=vlm-http-client`) to process the input directory.
+1.  **MinerU Parse Phase**: Starts a MinerU OpenAI-compatible parse server (`python -m mineru.cli.vlm_server`), waits for readiness (`/health` + served-model check), then calls MinerU's HTTP client path (`backend=vlm-http-client`) to process the input directory.
 2.  **vLLM Post-Processing Phase**: If LLM post-processing is enabled, the parse server is stopped first, a cooldown/VRAM-release guardrail is applied, then NoteLM starts its own post-processing vLLM server and processes converted text for OCR correction and image descriptions.
 3.  **Cleanup**: Deletes the input file upon successful processing (optional).
 4.  **Result**: Returns the result:
@@ -28,7 +28,7 @@ This dual-process architecture provides isolation; the supervisor remains respon
 
 #### vLLM Process
 When LLM post-processing is enabled, the handler uses a shared `vllm_server.py` manager abstraction for VLM-serving processes only:
-*   `mineru_parse` role: MinerU parsing server (`python -m mineru.cli.vlm_server openai_server`) is started first for parsing.
+*   `mineru_parse` role: MinerU parsing server (`python -m mineru.cli.vlm_server`) is started first for parsing.
 *   `notelm_postprocess` role: NoteLM post-processing server is started only after parse shutdown + cooldown handoff.
 *   A health-check endpoint (`GET /health`) is polled until the server is ready.
 *   Served-model readiness is also verified via `GET /v1/models` against `MINERU_VL_MODEL_NAME` when configured.

@@ -54,7 +54,6 @@ class TestCheckDependencies(unittest.TestCase):
                 "python3",
                 "-m",
                 "mineru.cli.vlm_server",
-                "openai_server",
                 "--served-model-name",
                 "opendatalab/MinerU2.5-2509-1.2B",
                 "--help",

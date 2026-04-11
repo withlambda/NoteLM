@@ -125,7 +125,7 @@ def main() -> None:
     lightweight_command_checks = [
         (["python3", "-m", "mineru.cli.client", "--help"], "MinerU client CLI module availability"),
         (
-            ["python3", "-m", "mineru.cli.vlm_server", "openai_server", "--help"],
+            ["python3", "-m", "mineru.cli.vlm_server", "--help"],
             "MinerU vLLM server CLI module availability",
         ),
         (["mineru-api", "--help"], "`mineru-api` command availability"),
@@ -138,7 +138,6 @@ def main() -> None:
                 "python3",
                 "-m",
                 "mineru.cli.vlm_server",
-                "openai_server",
                 "--served-model-name",
                 "opendatalab/MinerU2.5-2509-1.2B",
                 "--help",
