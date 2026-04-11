@@ -1,25 +1,10 @@
-# Copyright (C) 2026 withLambda
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 """
 Main handler for the mineru-vllm-worker.
 Orchestrates the conversion of documents using the MinerU library and
 optional post-processing using a vLLM-powered LLM server.
 """
 
-import atexit
+import asyncio
 import gc
 import logging
 import os
@@ -33,20 +18,14 @@ from typing import Optional, Any, Dict, Tuple, List
 import runpod
 import shutil
 import torch
-import torch.multiprocessing as mp
-import paddle
-
-from mineru.cli.common import MakeMode, do_parse
-
-# Set the multiprocessing start method early (required for CUDA)
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # Already set, which is fine
-    pass
+from mineru.cli.client import run_orchestrated_cli
 
 from vllm_worker import VllmWorker
-from settings import MinerUSettings, VllmSettings, GlobalConfig
+from settings import (
+    MinerUSettings,
+    VllmSettings,
+    GlobalConfig,
+)
 from utils import (
     check_is_dir,
     check_is_not_file,
@@ -58,6 +37,8 @@ from utils import (
     log_vram_usage,
     LanguageProcessor
 )
+from vllm_server import VllmServerManager, VllmServerRoleConfig
+from debug_dependencies import run_debug_dependency_check_if_enabled
 
 # Configure logging
 logging.basicConfig(
@@ -68,98 +49,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def release_vram() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-
-def mineru_worker_init() -> None:
-    """
-    Initializes MinerU worker process.
-    MinerU loads models on demand based on the mineru.json configuration.
-    This function verifies the config path and registers cleanup.
-    """
-    logger.info(f"Worker process with pid {os.getpid()} initializing MinerU...")
-
-    # MinerU config path is expected via environment variable MINERU_TOOLS_CONFIG_PATH
-    config_path = os.environ.get("MINERU_TOOLS_CONFIG_PATH")
-    if config_path:
-        if not Path(config_path).exists():
-            logger.warning(f"MinerU config not found at {config_path}. Falling back to defaults.")
-        else:
-            logger.info(f"MinerU using config from {config_path}")
-    else:
-        logger.warning("MINERU_TOOLS_CONFIG_PATH not set. MinerU will use default configuration.")
-
-    # Register cleanup on exit
-    atexit.register(mineru_worker_exit)
-    logger.info(f"Worker process with pid {os.getpid()} ready")
-
-
-def mineru_worker_exit() -> None:
-    """
-    Cleanup function for worker processes.
-    Releases GPU memory for both PaddlePaddle and PyTorch.
-    """
-    try:
-        # 1. Clear PaddlePaddle cache if available
-        if paddle and hasattr(paddle, 'device') and hasattr(paddle.device, 'cuda') and paddle.device.cuda.is_available():
-            logger.info(f"Process {os.getpid()}: Clearing PaddlePaddle CUDA cache")
-            paddle.device.cuda.empty_cache()
-
-        # 2. Force Python GC
-        gc.collect()
-
-        # 3. Synchronize and clear PyTorch CUDA cache
-        if torch.cuda.is_available():
-            logger.info(f"Process {os.getpid()}: Clearing PyTorch CUDA cache")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-
-        logger.info(f"Worker {os.getpid()} cleaned up VRAM.")
-    except Exception as e:
-        logger.warning(f"Error during worker cleanup for pid {os.getpid()}: {e}", exc_info=True)
-
-def calculate_optimal_mineru_workers(
-    num_files: int,
-    app_config: GlobalConfig,
-    mineru_config: MinerUSettings,
-) -> int:
-    """
-    Calculates the optimal number of MinerU worker processes based on
-    workload and available VRAM.
-
-    This function prevents GPU out-of-memory errors by ensuring that the
-    total VRAM reserved for MinerU processes (mineru_workers * vram_gb_per_worker)
-    plus the system reserve (vram_gb_reserve) does not exceed the total
-    available GPU memory.
-
-    Args:
-        num_files: The number of files in the current processing batch.
-        app_config: Global configuration containing total VRAM and reserve.
-        mineru_config: MinerU-specific settings (workers override, VRAM per worker).
-
-    Returns:
-        The number of worker processes to instantiate, bounded by workload,
-        available VRAM, and a reasonable parallel processing limit (default: 4).
-    """
-    # Get VRAM configuration
-
-    # Parse optimal_mineru_workers
-    if mineru_config.workers is not None:
-        optimal_mineru_workers = max(1, mineru_config.workers)
-    else:
-        # Linear/Consistent scaling for MinerU workers
-        optimal_mineru_workers = min(
-            4,
-            num_files,
-            (app_config.vram_gb_total - app_config.vram_gb_reserve) // mineru_config.vram_gb_per_worker
-        )
-
-    optimal_mineru_workers = max(1, optimal_mineru_workers)
-
-    logger.info(f"Calculated optimal MinerU workers for {num_files} files: "
-                f"mineru={optimal_mineru_workers}")
-
-    return optimal_mineru_workers
 
 def list_extracted_images_for_output_file(
     app_config: GlobalConfig,
@@ -196,6 +90,7 @@ def list_extracted_images_for_output_file(
         ])
 
     return sorted(image_paths, key=lambda path: path.name.lower())
+
 
 def insert_image_descriptions_to_text_file(
     app_config: GlobalConfig,
@@ -310,6 +205,7 @@ def insert_image_descriptions_to_text_file(
 
     return False
 
+
 def _parse_mineru_page_range(page_range: Optional[str]) -> Tuple[int, Optional[int]]:
     """
     Parses a page range string into start_page_id and end_page_id.
@@ -331,63 +227,31 @@ def _parse_mineru_page_range(page_range: Optional[str]) -> Tuple[int, Optional[i
         logger.warning(f"Invalid MinerU page range format: '{page_range}'. Processing entire file.")
         return 0, None
 
-
 def mineru_process_single_file(
-    app_config: GlobalConfig,
     file_path: Path,
     mineru_config_dict: Dict[str, Any],
     output_base_path: Path,
-    output_format: str
 ) -> Tuple[bool, Optional[Path]]:
     """
-    Processes a single PDF file using MinerU.
-    Uses process-local MinerU components.
+    Normalizes MinerU output artifacts for one file.
 
     Args:
-        app_config (GlobalConfig): Global configuration settings.
         file_path (Path): Path to the input file (e.g., .pdf).
         mineru_config_dict (Dict[str, Any]): Configuration for the MinerU converter.
         output_base_path (Path): The root directory where output for this file will be saved.
-        output_format (str): The desired output format (must be 'markdown').
 
     Returns:
         Tuple[bool, Optional[Path]]: A tuple containing (success_boolean, output_file_path).
     """
     try:
-        logger.info(f"Converting {file_path.name} in process with pid {os.getpid()} ...")
+        logger.info(f"Normalizing MinerU output artifacts for {file_path.name} ...")
 
         # Create a subfolder for this file's output
         file_stem = file_path.stem
         out_folder = Path(output_base_path) / file_stem
         out_folder.mkdir(parents=True, exist_ok=True)
 
-        pdf_bytes = file_path.read_bytes()
-
-        # Extract configurations from config dict
-        ocr_mode = mineru_config_dict.get("ocr_mode", "auto")
-        page_range = mineru_config_dict.get("page_range")
         disable_images = mineru_config_dict.get("disable_image_extraction", False)
-
-        start_page, end_page = _parse_mineru_page_range(page_range)
-
-        do_parse(
-            output_dir=str(out_folder),
-            pdf_file_names=[file_stem],
-            pdf_bytes_list=[pdf_bytes],
-            p_lang_list=[""],
-            backend="pipeline",
-            parse_method=ocr_mode,
-            f_draw_layout_bbox=False,
-            f_draw_span_bbox=False,
-            f_dump_md=True,
-            f_dump_middle_json=False,
-            f_dump_model_output=False,
-            f_dump_orig_pdf=False,
-            f_dump_content_list=False,
-            f_make_md_mode=MakeMode.MM_MD,
-            start_page_id=start_page,
-            end_page_id=end_page,
-        )
 
         # --- Normalize Output ---
         # MinerU often creates a subfolder named after the stem inside our out_folder
@@ -406,7 +270,7 @@ def mineru_process_single_file(
 
         if source_md != target_md:
             # Move the MD file up to the canonical location
-            # Use replace to overwrite if it somehow already exists
+            # Use replacement to overwrite if it somehow already exists
             source_md.replace(target_md)
 
             # Check for images subfolder relative to source md
@@ -418,7 +282,7 @@ def mineru_process_single_file(
                     # If image extraction is disabled, remove the images
                     shutil.rmtree(source_images)
                 else:
-                    # If target_images already exists, we might need to move contents instead of renaming folder
+                    # If target_images already exists, we might need to move contents instead of renaming the folder
                     if target_images.exists():
                         for img_file in source_images.iterdir():
                             if img_file.is_file():
@@ -430,7 +294,7 @@ def mineru_process_single_file(
                     else:
                         source_images.rename(target_images)
 
-            # Cleanup empty subfolders created by MinerU
+            # Clean up empty subfolders created by MinerU
             # Iterate through the parents of source_md until we reach out_folder
             curr = source_md.parent
             while curr != out_folder and curr.is_relative_to(out_folder):
@@ -444,7 +308,7 @@ def mineru_process_single_file(
             logger.error(f"MinerU produced markdown file but it could not be found at {target_md}")
             return False, None
 
-        logger.info(f"Finished {file_path.name}")
+        logger.info(f"Finished output normalization for {file_path.name}")
         return True, target_md
 
     except Exception as e:
@@ -505,9 +369,14 @@ def extract_mineru_settings_from_job_input(job_input: Dict[str, Any]) -> MinerUS
                     f"Unknown mineru setting '{k}' in job input. "
                     f"Valid fields: {sorted(valid_mineru_fields)}"
                 )
+                continue
             mineru_input[field_name] = v
 
     # Add shared parameters
+
+    if (doc_language:= job_input.get("doc_language")) is not None:
+        mineru_input["doc_language"] = doc_language.strip()
+
     mineru_input["output_format"] = job_input.get("output_format", "markdown")
     return MinerUSettings(**mineru_input)
 
@@ -553,11 +422,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         vllm_settings = extract_vllm_settings_from_job_input(app_config=app_config, job_input=job_input)
     mineru_settings = extract_mineru_settings_from_job_input(job_input=job_input)
 
+    server_manager = VllmServerManager()
     vllm_worker: Optional[VllmWorker] = None
 
     # --- 1. vLLM Worker Setup (Pre-processing) ---
     if app_config.use_postprocess_llm and vllm_settings:
-        vllm_worker = VllmWorker(settings=vllm_settings)
+        vllm_worker = VllmWorker(settings=vllm_settings, server_manager=server_manager)
 
     # Read base paths from global config
     storage_bucket_path = app_config.volume_root_mount_path
@@ -626,62 +496,110 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if not files_to_process:
         return {"status": "success", "message": "No supported files found to process."}
 
-    # --- Calculate optimal worker counts ---
-    optimal_mineru_workers = calculate_optimal_mineru_workers(
-        num_files=len(files_to_process),
-        app_config=app_config,
-        mineru_config=mineru_settings,
+    # --- Execute MinerU Processing ---
+    parse_server_role = "mineru_parse"
+    parse_server_command = [
+        sys.executable,
+        "-m",
+        "mineru.cli.vlm_server",
+        "openai_server",
+        "--engine",
+        "vllm",
+        "--host",
+        mineru_settings.vlm_host,
+        "--port",
+        str(mineru_settings.vlm_port),
+        "--served-model-name",
+        mineru_settings.vl_model_name,
+    ]
+
+    if mineru_settings.vlm_model_path:
+        parse_server_command.extend(["--model", mineru_settings.vlm_model_path])
+
+    server_manager.set_role_config(
+        VllmServerRoleConfig(
+            role=parse_server_role,
+            command=parse_server_command,
+            host=mineru_settings.vlm_host,
+            port=mineru_settings.vlm_port,
+            startup_timeout=mineru_settings.server_startup_timeout,
+            health_check_interval=mineru_settings.server_health_check_interval,
+            shutdown_grace_period=mineru_settings.server_shutdown_grace_period,
+            expected_model_id=mineru_settings.vl_model_name,
+            environment={
+                "MINERU_MODEL_SOURCE": mineru_settings.model_source,
+                "MINERU_VL_MODEL_NAME": mineru_settings.vl_model_name,
+            },
+        )
     )
 
-    maxtasksperchild_rendered = mineru_settings.maxtasksperchild if mineru_settings.maxtasksperchild is not None \
-        else 'unlimited'
-
-    # --- Execute MinerU Processing ---
-    logger.info(f"Starting conversion for {len(files_to_process)} files "
-                f"with MinerU using {optimal_mineru_workers} workers "
-                f"and {maxtasksperchild_rendered} max tasks per worker...")
+    logger.info(
+        f"Starting MinerU orchestration for {len(files_to_process)} files "
+        f"using backend={mineru_settings.backend} and server_url={mineru_settings.server_url}"
+    )
     start_time = time.time()
-    processed_files = [] # Paths of successfully processed output files
-    successful_inputs = [] # Original paths of successfully processed files
+    processed_files = []  # Paths of successfully processed output files
+    successful_inputs = []  # Original paths of successfully processed files
 
     try:
-        # Prepare arguments for each file
-        task_args = [
-            (app_config, file_to_process, mineru_config, output_path, output_format)
-            for file_to_process in files_to_process
-        ]
+        server_manager.start(parse_server_role)
+        server_manager.wait_for_server_ready(
+            role=parse_server_role,
+            retry_count=mineru_settings.server_ready_check_retries,
+            retry_delay=mineru_settings.server_ready_check_delay,
+        )
 
-        # Use multiprocessing Pool with worker initialization
-        with mp.Pool(
-            processes=optimal_mineru_workers,
-            initializer=mineru_worker_init,
-            maxtasksperchild=mineru_settings.maxtasksperchild  # Recycle workers periodically to free VRAM
-        ) as pool:
-            # Process files and collect results
-            results = pool.starmap(mineru_process_single_file, task_args, chunksize=1)
+        start_page, end_page = _parse_mineru_page_range(mineru_settings.page_range)
+        asyncio.run(
+            run_orchestrated_cli(
+                input_path=input_path,
+                output_dir=output_path,
+                method=mineru_settings.ocr_mode,
+                backend=mineru_settings.backend,
+                lang=mineru_settings.doc_language,
+                server_url=mineru_settings.server_url,
+                api_url=mineru_settings.api_url,
+                start_page_id=start_page,
+                end_page_id=end_page,
+                formula_enable=True,
+                table_enable=True,
+                extra_cli_args=(),
+            )
+        )
 
-            # Separate successful results from failed ones
-            for idx, (success, output_file_path) in enumerate(results):
-                if success and output_file_path:
-                    processed_files.append(output_file_path)
-                    successful_inputs.append(files_to_process[idx])
+        for file_to_process in files_to_process:
+            success, output_file_path = mineru_process_single_file(
+                file_to_process,
+                mineru_config,
+                output_path,
+            )
+            if success and output_file_path:
+                processed_files.append(output_file_path)
+                successful_inputs.append(file_to_process)
 
         end_time = time.time()
         logger.info(f"MinerU execution took: {end_time - start_time:.2f} seconds")
-        gc.collect()
-        torch.cuda.empty_cache()
-        log_vram_usage("After MinerU")
 
     except Exception as e:
         logger.error(f"Unexpected error occurred during MinerU processing: {e}")
         # If MinerU fails critically, we abort
         raise
+    finally:
+        server_manager.stop(parse_server_role)
+        release_vram()
+        log_vram_usage("After MinerU")
 
     logger.info("MinerU Processing completed")
 
     # --- 3. vLLM LLM Post-processing (Parallel) ---
     failed_post_processing = []
     if app_config.use_postprocess_llm and vllm_worker and processed_files:
+        server_manager.handoff(
+            parse_role=parse_server_role,
+            post_role="notelm_postprocess",
+            cooldown_seconds=mineru_settings.server_cooldown_seconds,
+        )
+
         # Note: MinerU worker processes have terminated, releasing their VRAM
         # vLLM now has full access to VRAM
         log_vram_usage("Before starting vLLM server")
@@ -780,4 +698,5 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 if __name__ == "__main__":
+    run_debug_dependency_check_if_enabled()
     runpod.serverless.start({"handler": handler})

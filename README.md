@@ -7,8 +7,8 @@ This project provides a Dockerized solution for running `MinerU` with `vLLM` LLM
 ## Architecture
 
 The container runs a Python handler script that listens for jobs from the RunPod API. When a job is received, it:
-1.  **MinerU Phase**: Processes the specified input directory using `MinerU` for document conversion (OCR, visual layout analysis, etc.).
-2.  **vLLM Phase**: If LLM post-processing is enabled, starts a vLLM server subprocess, waits for readiness via health-check polling, and processes converted text through the model for OCR error correction and image descriptions.
+1.  **MinerU Parse Phase**: Starts a MinerU OpenAI-compatible parse server (`mineru.cli.vlm_server openai_server`), waits for readiness (`/health` + served-model check), then calls MinerU's HTTP client path (`backend=vlm-http-client`) to process the input directory.
+2.  **vLLM Post-Processing Phase**: If LLM post-processing is enabled, the parse server is stopped first, a cooldown/VRAM-release guardrail is applied, then NoteLM starts its own post-processing vLLM server and processes converted text for OCR correction and image descriptions.
 3.  **Cleanup**: Deletes the input file upon successful processing (optional).
 4.  **Result**: Returns the result:
     -   `status`: `completed`, `partially_completed` (if some files failed post-processing), or `success` (if no files were found).
@@ -27,12 +27,14 @@ There are typically two processes named `python3 -u handler.py`. This is standar
 This dual-process architecture provides isolation; the supervisor remains responsive even if a worker process encounters a critical failure (like a segfault or Out-of-Memory error). Both processes share the same command name because they are initialized using the `spawn` start method, which is required for safe CUDA operations.
 
 #### vLLM Process
-When LLM post-processing is enabled, the handler spawns a vLLM server subprocess (`vllm serve`):
-*   The server is started after MinerU processing completes and VRAM is freed.
+When LLM post-processing is enabled, the handler uses a shared `vllm_server.py` manager abstraction for VLM-serving processes only:
+*   `mineru_parse` role: MinerU parsing server (`python -m mineru.cli.vlm_server openai_server`) is started first for parsing.
+*   `notelm_postprocess` role: NoteLM post-processing server is started only after parse shutdown + cooldown handoff.
 *   A health-check endpoint (`GET /health`) is polled until the server is ready.
-*   Communication uses the OpenAI-compatible API via the `openai` Python client.
-*   After all post-processing is complete, the server is gracefully shut down (SIGTERM → wait 10s → SIGKILL).
-*   If the server crashes mid-processing, one automatic restart is attempted before failing the job.
+*   Served-model readiness is also verified via `GET /v1/models` against `MINERU_VL_MODEL_NAME` when configured.
+*   The shared manager enforces strict single-role ownership at a time and does **not** manage `mineru-api` lifecycle.
+*   Communication in post-processing uses the OpenAI-compatible API via the `openai` Python client.
+*   After post-processing completes, the server is gracefully shut down (SIGTERM → wait grace period → SIGKILL fallback).
 
 ## Features
 
@@ -42,7 +44,7 @@ When LLM post-processing is enabled, the handler spawns a vLLM server subprocess
 *   **Language-Aware Image Descriptions**: Automatically detects the document language (per-file) and generates image descriptions in that language using localized Markdown wrappers (supports English, German, French, Spanish, Italian, Portuguese, Dutch, Polish, Czech, and Russian).
 *   **Token Precision**: Integrates `tiktoken` for accurate context window utilization during text chunking.
 *   **Local Model Weights**: Loads models directly from a local directory (`NOTELM_VLLM_MODEL_PATH`), avoiding runtime downloads.
-*   **NVIDIA Optimized**: Uses the official `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime` base image for maximum GPU performance.
+*   **NVIDIA Optimized**: Uses the official `vllm/vllm-openai:v0.18.0` base image for GPU-ready OpenAI-compatible serving.
 *   **Configurable**: Job inputs can override default environment variables.
 
 ### VRAM Management
@@ -83,6 +85,8 @@ This sequential execution model ensures that vLLM has full access to VRAM for lo
     ```
 
     *Note:* The build environment includes all necessary dependencies for both MinerU and vLLM.
+    `vllm` is intentionally provided by the Docker base image (`vllm/vllm-openai:v0.18.0`) rather than pinned in `requirements.txt`.
+    Optional startup dependency checks remain runtime-only and run only when `DEBUG=true`.
 
 3.  Push the image to a container registry (e.g., Docker Hub, GHCR).
 
@@ -133,10 +137,15 @@ You can trigger the worker with a JSON payload. `input_dir` and `output_dir` are
 ```json
 {
   "input": {
-    "input_dir": "input/documents/", 
+    "input_dir": "input/documents/",
     "output_dir": "output",
+    "doc_language": "en",
+    "mineru_backend": "vlm-http-client",
+    "mineru_api_url": "http://127.0.0.1:8080",
+    "mineru_server_url": "http://127.0.0.1:30000",
+    "mineru_model_source": "local",
+    "mineru_vl_model_name": "opendatalab/MinerU2.5-2509-1.2B",
     "output_format": "markdown",
-    "mineru_workers": 2,
     "mineru_ocr_mode": "ocr",
     "mineru_page_range": "0-10",
     "mineru_disable_image_extraction": false,
@@ -152,6 +161,7 @@ You can trigger the worker with a JSON payload. `input_dir` and `output_dir` are
 
 *   `input_dir`: **Required**. The path to the directory to process, relative to `VOLUME_ROOT_MOUNT_PATH` (absolute paths are also supported). The directory must contain one or more files in supported formats: PDF, PPTX, DOCX, XLSX, HTML, EPUB.
 *   `output_dir`: **Required**. The directory where the processed output will be saved, relative to `VOLUME_ROOT_MOUNT_PATH` (absolute paths are also supported).
+*   `doc_language`: (Optional) MinerU OCR language code for the input document. Defaults to `en`. Supported values match MinerU's API language list, including `ch`, `ch_lite`, `ch_server`, `en`, `korean`, `japan`, `chinese_cht`, `ta`, `te`, `ka`, `th`, `el`, `latin`, `arabic`, `east_slavic`, `cyrillic`, and `devanagari`.
 *   `output_format`: (Optional) The format for the output results. Supported options: `markdown`, `json`, `html`, `chunks`. Default: `markdown`. **Note**: LLM post-processing on `json` and `html` formats is experimental and may produce invalid syntax due to text chunking.
 *   `delete_input_on_success`: (Optional) Boolean. If true, deletes input files after they have been successfully processed. Default: `false`.
 
@@ -170,13 +180,24 @@ The following `mineru_`-prefixed keys can be used in the `input` section of the 
 
 | Key                               | Description                                                     | Default    |
 |:----------------------------------|:----------------------------------------------------------------|:-----------|
-| `mineru_workers`                  | Number of documents to process in parallel.                     | `auto`     |
+| `mineru_backend`                  | MinerU parse backend. Must be `vlm-http-client`.               | `vlm-http-client` |
+| `mineru_api_url`                  | Optional MinerU API URL. If omitted, local API is used by MinerU tools. | `None` |
+| `mineru_server_url`               | OpenAI-compatible parse server URL used by MinerU HTTP client. | `http://127.0.0.1:30000` |
+| `mineru_model_source`             | MinerU model source mode.                                       | `local` |
+| `mineru_vl_model_name`            | Served model identifier sent by MinerU requests.                | `opendatalab/MinerU2.5-2509-1.2B` |
+| `mineru_vlm_host`                 | Host for local parse-server startup in NoteLM.                  | `127.0.0.1` |
+| `mineru_vlm_port`                 | Port for local parse-server startup in NoteLM.                  | `30000` |
+| `mineru_vlm_model_path`           | Optional local model path passed to parse-server startup.       | `None` |
+| `mineru_vlm_startup_timeout`      | Parse-server readiness timeout in seconds.                      | `120` |
+| `mineru_vlm_health_check_interval`| Parse-server readiness polling interval (seconds).              | `1.0` |
+| `mineru_vlm_shutdown_grace_period`| Graceful shutdown timeout for parse server (seconds).           | `15` |
+| `mineru_vlm_cooldown_seconds`     | Cooldown between parse shutdown and post-processing startup.    | `5` |
 | `mineru_ocr_mode`                 | OCR mode for PDF parsing (`auto`, `txt`, `ocr`).                | `auto`     |
 | `mineru_page_range`               | Page range to convert (e.g., "0-10").                           | `None`     |
 | `mineru_disable_image_extraction` | Disable image extraction and removal of `images` subfolder.     | `false`    |
 | `mineru_output_format`            | The format of the output (always `markdown`).                   | `markdown` |
-| `mineru_maxtasksperchild`         | Tasks per worker before recycling (prevents memory leaks).      | `25`       |
-| `mineru_disable_maxtasksperchild` | Disable automatic recycling of tasks for the child process.     | `false`    |
+
+Removed legacy keys are rejected with `ValueError`: `mineru_workers`, `mineru_vram_gb_per_worker`, `mineru_disable_maxtasksperchild`, `mineru_maxtasksperchild` and their uppercase/env aliases.
 
 #### vLLM Configuration Overrides
 
@@ -220,11 +241,11 @@ This maximizes chunk-level parallelism for faster LLM processing of large docume
   "input": {
     "input_dir": "input/batch/",
     "output_dir": "output",
-    "mineru_workers": 4
+    "mineru_backend": "vlm-http-client"
   }
 }
 ```
-This processes multiple files in parallel through the MinerU phase.
+This keeps parse-task concurrency on the MinerU server/client side while NoteLM performs one orchestrated parse invocation per job.
 
 **Example 3: Conservative Settings (Low VRAM)**
 ```json
@@ -232,12 +253,12 @@ This processes multiple files in parallel through the MinerU phase.
   "input": {
     "input_dir": "input/",
     "output_dir": "output",
-    "mineru_workers": 1,
+    "mineru_vlm_cooldown_seconds": 8,
     "vllm_chunk_workers": 1
   }
 }
 ```
-For GPUs with <16GB VRAM, disable parallelization to prevent OOM errors.
+For GPUs with <16GB VRAM, reduce post-processing parallelization and allow a longer parse→postprocess handoff cooldown.
 
 ### Block Correction Prompt Catalog
 
@@ -395,24 +416,32 @@ The worker can be configured using environment variables. For `VllmSettings`, us
 | `IMAGE_DESCRIPTION_END`                    | Marker at the end of an image description.                                                                                                                                                                                | `**[END IMAGE DESCRIPTION]**`                 |
 | `HF_HOME`                                  | Path to Hugging Face cache.                                                                                                                                                                                               | `${VOLUME_ROOT_MOUNT_PATH}/huggingface-cache` |
 | `MINERU_DEBUG`                             | Enable debug mode.                                                                                                                                                                                                        | `False`                                       |
-| `MINERU_WORKERS`                           | Number of MinerU workers (env-level default).                                                                                                                                                                             | `auto`                                        |
-| `MINERU_FORCE_OCR`                         | Force OCR even if text is present.                                                                                                                                                                                        | `false`                                       |
+| `MINERU_BACKEND`                           | MinerU parse backend. Must remain `vlm-http-client` in this runtime path.                                                                                                                                                | `vlm-http-client`                             |
+| `MINERU_API_URL`                           | Optional MinerU API URL for remote orchestration. If unset, local MinerU API is used.                                                                                                                                   | `None`                                        |
+| `MINERU_SERVER_URL`                        | OpenAI-compatible parse-server URL used by MinerU HTTP client calls.                                                                                                                                                     | `http://127.0.0.1:30000`                      |
+| `MINERU_DOC_LANGUAGE`                      | Default MinerU OCR language code for document parsing.                                                                                                                                                                   | `en`                                          |
+| `MINERU_MODEL_SOURCE`                      | MinerU model source mode for parse requests.                                                                                                                                                                              | `local`                                       |
+| `MINERU_VL_MODEL_NAME`                     | Served model identifier used by parse server and client calls.                                                                                                                                                           | `opendatalab/MinerU2.5-2509-1.2B`             |
+| `MINERU_VLM_HOST`                          | Host used when NoteLM starts the local MinerU parse server.                                                                                                                                                              | `127.0.0.1`                                   |
+| `MINERU_VLM_PORT`                          | Port used when NoteLM starts the local MinerU parse server.                                                                                                                                                              | `30000`                                       |
+| `MINERU_VLM_MODEL_PATH`                    | Optional local model path passed through to parse server startup.                                                                                                                                                        | `None`                                        |
+| `MINERU_VLM_STARTUP_TIMEOUT`               | Parse-server readiness timeout in seconds.                                                                                                                                                                                | `120`                                         |
+| `MINERU_VLM_HEALTH_CHECK_INTERVAL`         | Parse-server readiness polling interval in seconds.                                                                                                                                                                       | `1.0`                                         |
+| `MINERU_VLM_SHUTDOWN_GRACE_PERIOD`         | Parse-server graceful shutdown timeout in seconds.                                                                                                                                                                        | `15`                                          |
+| `MINERU_VLM_COOLDOWN_SECONDS`              | Cooldown between parse-server stop and post-processing-server start.                                                                                                                                                     | `5`                                           |
 | `MINERU_PAGE_RANGE`                        | Default page range to convert.                                                                                                                                                                                            | `None`                                        |
 | `MINERU_OUTPUT_FORMAT`                     | Default output format (markdown, json, etc.).                                                                                                                                                                             | `markdown`                                    |
-| `MINERU_MAXTASKSPERCHILD`                  | Tasks per worker before recycling (prevents memory leaks).                                                                                                                                                                | `25`                                          |
-| `MINERU_DISABLE_MAXTASKSPERCHILD`          | Disable automatic recycling of tasks for the child process.                                                                                                                                                               | `false`                                       |
 | `MINERU_TOOLS_CONFIG_PATH`                 | Path to `mineru.json` configuration file.                                                                                                                                                                                 | `/app/mineru.json`                            |
 
 ### Performance Tuning Variables
 
-The worker includes adaptive parallelization to maximize GPU utilization (optimized for 24GB VRAM). These settings are automatically calculated based on workload but can be manually overridden.
+The worker keeps parse and post-processing server ownership strictly sequential to avoid nested server contention. Tune the post-processing side and handoff behavior explicitly.
 
 | Variable                     | Description                                                                                  | Default    | Recommended Range |
 |:-----------------------------|:---------------------------------------------------------------------------------------------|:-----------|:------------------|
 | `VRAM_GB_TOTAL`              | Total VRAM available on your GPU (Required).                                                 | **None**   | `8-80`            |
 | `VRAM_GB_RESERVE`            | VRAM to reserve for system/other processes (GB).                                             | `4`        | `1-8`             |
 | `NOTELM_VLLM_CHUNK_SIZE`    | Tokens per chunk for LLM processing. Smaller = more parallelism, larger = better context.    | `4000`     | `2000-8000`       |
-| `MINERU_VRAM_GB_PER_WORKER`  | Estimated VRAM per MinerU worker (GB). Used for auto-calculating `mineru_workers`.           | `5`        | `3-6`             |
 | `NOTELM_VLLM_MAX_MODEL_LEN` | Max context/sequence length (tokens). Used for auto-calculating `NOTELM_VLLM_MAX_NUM_SEQS`. | `16384`     | `2048-32768`      |
 | `VRAM_GB_PER_TOKEN_FACTOR`   | VRAM (GB) per token. Used for auto-calculating `NOTELM_VLLM_MAX_NUM_SEQS`.                  | `0.00013`  | `0.0001-0.0005`   |
 | `NOTELM_VLLM_VRAM_GB_MODEL` | VRAM (GB) consumed by the model. Used for auto-calculating `NOTELM_VLLM_MAX_NUM_SEQS`.      | (Required) | `2-16`            |
@@ -421,34 +450,37 @@ The worker includes adaptive parallelization to maximize GPU utilization (optimi
 | `NOTELM_VLLM_MAX_NUM_SEQS`  | Max concurrent sequences (auto-calculated from VRAM if unset).                               | `16`       | `1-32`            |
 | `NOTELM_VLLM_GPU_UTIL`      | Maximum GPU memory fraction for vLLM.                                                        | `0.85`     | `0.5-0.95`        |
 
-#### Adaptive Worker Scaling (Auto Mode)
+#### Concurrency and Ownership Rules
 
-When set to `auto` (default), the worker automatically optimizes parallelism based on:
-
-**vLLM Concurrency**:
+**vLLM Post-processing Concurrency**:
 - `NOTELM_VLLM_MAX_NUM_SEQS` is calculated based on available VRAM and context window size:
   `max_num_seqs = floor((TOTAL_VRAM - VRAM_RESERVE - NOTELM_VLLM_VRAM_GB_MODEL) / (VRAM_GB_PER_TOKEN_FACTOR * NOTELM_VLLM_MAX_MODEL_LEN))`
 - **Precise Token Counting**: Uses the `tiktoken` library to accurately measure chunk sizes for OpenAI-compatible models, ensuring optimal context window utilization.
 - `vllm_chunk_workers` (async tasks) defaults to 16, controlling parallel chunk processing.
-- The vLLM server is started as a subprocess and monitored via a health check endpoint with a configurable startup timeout (`NOTELM_VLLM_STARTUP_TIMEOUT`).
+- The post-processing vLLM server is started via the shared manager after parse handoff and monitored via health checks.
 
-**MinerU Concurrency**:
-- `mineru_workers` is scaled based on number of files and available VRAM (capped at 4).
+**MinerU Parse Concurrency**:
+- Parse-task concurrency is owned by MinerU's selected HTTP client/API server path (`backend=vlm-http-client`), not by NoteLM worker-level `mineru_workers` controls.
+- Removed legacy knobs (`MINERU_WORKERS`, `MINERU_VRAM_GB_PER_WORKER`, `MINERU_MAXTASKSPERCHILD`, `MINERU_DISABLE_MAXTASKSPERCHILD`) are intentionally rejected with `ValueError`.
+
+**Lifecycle/Handoff Guarantees**:
+- Parse VLM server starts and reaches readiness before MinerU parse requests are issued.
+- Parse VLM server is stopped before post-processing VLM server startup.
+- Optional cooldown (`MINERU_VLM_COOLDOWN_SECONDS`) enforces VRAM-release guardrail between phases.
 
 **Processing Scenarios**:
 
 **Single File** (1 file):
-- `mineru_workers=1` (no file-level parallelism needed)
 - `vllm_chunk_workers` for parallel chunk processing
 - **Best for**: Processing single large PDFs efficiently
 
 **Small Batch** (2-3 files):
-- `mineru_workers` (moderate file parallelism, up to 2)
+- one orchestrated MinerU parse call over the batch input path
 - `vllm_chunk_workers` for parallel chunk processing
 - **Best for**: Medium workloads with moderate-sized PDFs
 
 **Large Batch** (4+ files):
-- `mineru_workers` (maximize MinerU file parallelism, up to 4)
+- one orchestrated MinerU parse call over the batch input path
 - `vllm_chunk_workers` for parallel chunk processing (files processed sequentially)
 - **Best for**: Batch processing many small-to-medium PDFs
 
@@ -504,11 +536,15 @@ The following environment variables are recommended for a cloud deployment with 
 | `HF_HUB_OFFLINE`                   | Hugging Face      | Run Hugging Face Hub in offline mode (prevents downloads).                                      | `1`                                                                     |
 | `TRANSFORMERS_OFFLINE`             | Transformers      | Prevents the Transformers library from downloading model weights.                               | `1`                                                                     |
 | `MINERU_DEBUG`                     | MinerU            | Enable debug mode for detailed logging.                                                         | `false`                                                                 |
-| `MINERU_WORKERS`                   | MinerU            | Number of MinerU workers (auto-calculated if unset).                                            | `auto`                                                                  |
-| `MINERU_FORCE_OCR`                 | MinerU            | Force OCR even if text is present.                                                              | `false`                                                                 |
+| `MINERU_BACKEND`                   | MinerU            | Parse backend; must remain `vlm-http-client`.                                                   | `vlm-http-client`                                                       |
+| `MINERU_API_URL`                   | MinerU            | Optional remote MinerU API URL (if unset, local MinerU API path is used).                      | `None`                                                                  |
+| `MINERU_SERVER_URL`                | MinerU            | OpenAI-compatible parse server URL.                                                             | `http://127.0.0.1:30000`                                                |
+| `MINERU_MODEL_SOURCE`              | MinerU            | Model source mode for parse requests.                                                           | `local`                                                                 |
+| `MINERU_VL_MODEL_NAME`             | MinerU            | Served model identifier for parse requests.                                                     | `opendatalab/MinerU2.5-2509-1.2B`                                       |
+| `MINERU_VLM_HOST`                  | MinerU            | Host for local parse-server startup.                                                            | `127.0.0.1`                                                             |
+| `MINERU_VLM_PORT`                  | MinerU            | Port for local parse-server startup.                                                            | `30000`                                                                 |
+| `MINERU_VLM_COOLDOWN_SECONDS`      | MinerU            | Cooldown between parse shutdown and post-processing startup.                                    | `5`                                                                     |
 | `MINERU_OUTPUT_FORMAT`             | MinerU            | Default output format (markdown, json, etc.).                                                   | `markdown`                                                              |
-| `MINERU_MAXTASKSPERCHILD`          | MinerU            | Tasks per worker before recycling (prevents memory leaks).                                      | `25`                                                                    |
-| `MINERU_VRAM_GB_PER_WORKER`        | MinerU            | Estimated VRAM per MinerU worker (GB) for auto-scaling.                                         | `5`                                                                     |
 | (x) `PYTORCH_CUDA_ALLOC_CONF`      | PyTorch           | CUDA memory allocator configuration (e.g., `expandable_segments:True` to reduce fragmentation). | `expandable_segments:True`                                              |
 | `PYTORCH_ENABLE_MPS_FALLBACK`      | PyTorch           | Fallback to CPU if MPS operations aren't supported.                                             | `1`                                                                     |
 | `TORCH_DEVICE`                     | PyTorch           | Device to use (`cpu`, `cuda`, `mps`) - auto-detected if unset.                                  | `cuda`                                                                  |
@@ -528,7 +564,8 @@ The following environment variables are recommended for a cloud deployment with 
 - Set `NOTELM_VLLM_MODEL_PATH` to the absolute path where your model weights are stored.
 - Adjust `NOTELM_VLLM_VRAM_GB_MODEL` based on your specific model size (7B models typically use 6-8GB).
 - For models with larger context windows (16k+), increase `NOTELM_VLLM_MAX_MODEL_LEN` and reduce `NOTELM_VLLM_MAX_NUM_SEQS`.
-- The `MINERU_WORKERS` and `NOTELM_VLLM_MAX_NUM_SEQS` values are auto-calculated based on available VRAM when set to `auto`.
+- Parse-phase concurrency is owned by MinerU's HTTP client/API server path; NoteLM does not expose worker-level MinerU concurrency controls.
+- Removed legacy MinerU keys (`MINERU_WORKERS`, `MINERU_VRAM_GB_PER_WORKER`, `MINERU_MAXTASKSPERCHILD`, `MINERU_DISABLE_MAXTASKSPERCHILD`) are rejected with `ValueError`.
 - CPU thread counts (`TORCH_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`) should be adjusted based on your CPU core count (4 is suitable for 8-16 core systems).
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` helps reduce memory fragmentation during long-running jobs.
 - `NCCL_P2P_DISABLE=1` is recommended for single-GPU deployments to avoid unnecessary overhead.
@@ -543,8 +580,7 @@ The following variables can also be set to further customize the environment, th
 | Variable                   | Description                                  |
 |:---------------------------|:---------------------------------------------|
 | `MINERU_TOOLS_CONFIG_PATH` | Path to `mineru.json` configuration file.    |
-| `MINERU_WORKERS`           | Number of MinerU workers (auto-calculated).  |
-| `MINERU_VRAM_GB_PER_WORKER`| Estimated VRAM per MinerU worker (GB).       |
+| `MINERU_VL_MODEL_NAME`     | Served model identifier for parse requests.  |
 
 **Tools / Performance**
 
@@ -571,18 +607,31 @@ The following variables can also be set to further customize the environment, th
 
 ## Local Testing
 
-You can test the handler logic locally using the provided test scripts.
+You can validate the Docker image locally using a single-build/single-run workflow.
 
 1.  **Install dependencies**:
     ```bash
     pip install -r requirements.txt
     ```
 
-2.  **Run the Test**:
-    The `test/run.sh` script sets up a local environment and runs the handler with a sample payload.
+2.  **Run Docker validation**:
+    The `test/run.sh` script now performs one Docker image build and one container run, then executes all validation stages in-container (`debug-deps-default`, `deps`, `cli-smoke`, `server-readiness`, `e2e-output`, `runtime-assets`, optional `debug-deps-true`).
     ```bash
     cd test
     ./run.sh
+    ```
+
+3.  **Inspect persisted results**:
+    Validation artifacts are always written to `build/test/results/` and include:
+    - `summary.json` (stage statuses, timestamps, final exit code)
+    - `stages/*.log` (per-stage diagnostics)
+    - `output-manifest.json` (detected markdown outputs)
+    - `runtime-assets.json` (required runtime model/asset presence report)
+
+4.  **Optional DEBUG=true validation stage**:
+    To additionally run the debug-gated dependency path inside the same container run:
+    ```bash
+    VALIDATE_DEBUG_TRUE=1 ./run.sh
     ```
 
 ## Development

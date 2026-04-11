@@ -63,7 +63,7 @@ def test_handler() -> None:
         "input": {
             "input_dir": input_dir, # Process the entire input directory
             "output_dir": output_dir,
-            "mineru_workers": 1,
+            "mineru_backend": "vlm-http-client",
             "vllm_chunk_workers": 1,
             "mineru_ocr_mode": "auto"
         }

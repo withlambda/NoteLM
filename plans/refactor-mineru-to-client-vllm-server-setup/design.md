@@ -183,22 +183,52 @@ Task 01 must leave behind an explicit decision record in this file before downst
 
 ## Selected Integration Contract (Task 01 Output Template)
 
-- `Selected option:`
+- `Selected option:` **Option A** (MinerU-native orchestration): use MinerU’s orchestrated client/API path (`run_orchestrated_cli` + `LocalAPIServer`/`mineru-api`) and MinerU’s official OpenAI-compatible serving entrypoint (`mineru-openai-server`) for parsing.
 - `Rejected options + rationale:`
-- `Parse orchestration entrypoint:`
-- `OpenAI-compatible VLM server entrypoint:`
+  - **Option B** rejected as default because it keeps NoteLM as the parse submitter (`do_parse` / `aio_do_parse`) and weakens the required full-concurrency delegation to MinerU server-side orchestration.
+  - **Option C** rejected except emergency fallback because it duplicates MinerU’s official server wrapper behavior in NoteLM and increases divergence/risk.
+- `Parse orchestration entrypoint:` `mineru.cli.client.run_orchestrated_cli(...)` with `backend="vlm-http-client"`; when `api_url` is omitted, MinerU starts local `mineru-api` through `LocalAPIServer.start()` (`python -m mineru.cli.fast_api`) and owns submit/poll concurrency.
+- `OpenAI-compatible VLM server entrypoint:` `mineru-openai-server --engine vllm --host <MINERU_VLM_HOST> --port <MINERU_VLM_PORT> --served-model-name <MINERU_VL_MODEL_NAME> [--model <MINERU_VLM_MODEL_PATH>]` (module equivalent: `python -m mineru.cli.vlm_server openai_server ...`).
 - `Health endpoints + readiness checks:`
-- `Concurrency owner:` Prefer MinerU’s client/API server-side orchestration unless Task 01 documents a feasibility blocker.
-- `Task partitioning:`
-- `Config/env source of truth:` backend, `api_url`, `server_url`, `MINERU_MODEL_SOURCE`, `MINERU_VL_MODEL_NAME`, ports, timeouts.
+  - Parse orchestration API: `http://<api_host>:<api_port>/health` checked by MinerU `wait_for_local_api_ready` before submissions.
+  - OpenAI-compatible parsing server: `http://<parse_vllm_host>:<parse_vllm_port>/health` plus `GET /v1/models` before parse requests.
+  - Failure mode: if either process exits before readiness, startup is treated as failed (non-zero) and parsing aborts.
+- `Concurrency owner:` **MinerU API server-side orchestration** (preferred and required for Option A). NoteLM must submit one orchestrated parse job flow and must not wrap MinerU parse calls in an outer multiprocessing file pool.
+- `Task partitioning:` For non-`pipeline` backends, MinerU plans one document per task and applies bounded server-side submit concurrency; task windows are not NoteLM-owned under Option A.
+- `Config/env source of truth:`
+  - Backend: `mineru_backend` default `vlm-http-client` (no silent fallback to `pipeline`).
+  - Parse API URL (`api_url`): explicit setting/env for remote MinerU API; if absent, local MinerU API lifecycle is started by MinerU helper.
+  - OpenAI server URL (`server_url`): explicit setting/env consumed by MinerU HTTP-client parse requests.
+  - `MINERU_MODEL_SOURCE`: default `local`.
+  - `MINERU_VL_MODEL_NAME`: default `opendatalab/MinerU2.5-2509-1.2B` (request-time model name).
+  - Ports/timeouts: parse OpenAI server default `127.0.0.1:30000`; post-processing server default stays NoteLM-configured (`NOTELM_VLLM_HOST`/`NOTELM_VLLM_PORT`, currently `127.0.0.1:8001`); startup timeout and retry budgets are explicit config (no implicit infinite waits).
 - `Served model identifier proof:`
-- `Server ownership split:` MinerU external parsing server only; NoteLM retains its own post-processing server lifecycle.
-- `Shared vllm_server.py manager contract:` owns VLM-serving processes only; `mineru-api` lifecycle is documented separately.
-- `Parse output artifact contract:`
+  - Contracted proof command: `curl -s http://<parse_vllm_host>:<parse_vllm_port>/v1/models`.
+  - Required mapping rule: NoteLM sets `--served-model-name <MINERU_VL_MODEL_NAME>` for parsing server startup and must assert the returned model `id` equals `MINERU_VL_MODEL_NAME` before parse submission.
+  - Guardrail: do not assume weight source/path string is request-time model id; verify `/v1/models` each startup.
+- `Server ownership split:` external server started for MinerU parsing only; NoteLM keeps a separate post-processing server lifecycle and never reuses MinerU parse server as a shared always-on process.
+- `Shared vllm_server.py manager contract:` introduce one shared `VllmServerManager` interface for VLM-serving roles only (parse role + post-process role): `start(role, ...)`, `wait_ready(...)`, `stop(role)`, `handoff(parse_role, post_role)`. `mineru-api` lifecycle ownership remains outside this class (MinerU helpers or a dedicated thin wrapper).
+- `Parse output artifact contract:` preserve one deterministic mapping per input file: each input `<name>.pdf` maps to `<output>/<name>/<name>.md`; extracted images remain under `<output>/<name>/images`; downstream post-processing consumes the normalized markdown path and image directory from that same stem folder.
 - `Shutdown / VRAM-release handoff guardrail:`
-- `Removed/rejected legacy settings:`
-- `Legacy-key rejection mode:`
+  1. parsing VLM server stop requested and process exit observed;
+  2. cleanup hooks run (`gc.collect()` + CUDA cache cleanup when available);
+  3. configured cooldown elapses;
+  4. post-processing server start is blocked/fails if parse server is still alive or readiness cannot be reached within configured retry budget.
+  - Parallel parse/post-process VLM server overlap is forbidden.
+- `Removed/rejected legacy settings:` canonical removal/rejection list for the new path: `mineru_workers`, `MINERU_WORKERS`, `mineru_vram_gb_per_worker`, `MINERU_VRAM_GB_PER_WORKER`, `mineru_disable_maxtasksperchild`, `MINERU_DISABLE_MAXTASKSPERCHILD`, `mineru_maxtasksperchild`, `MINERU_MAXTASKSPERCHILD`.
+- `Legacy-key rejection mode:` enforce one rejection mode across settings extraction, job-input parsing, tests, and docs: fail fast with explicit validation error (`ValueError`) naming the disallowed key; no compatibility aliasing or silent drop.
 - `Dependency proof method + exact MinerU 3.0.7 requirement string:`
+  - Candidate requirement pin for selected path: `mineru[vllm]==3.0.7`.
+  - Proof method to codify in Task 03 dependency checks:
+    - import/module checks for `mineru.cli.client`, `mineru.cli.fast_api`, `mineru.cli.vlm_server`;
+    - CLI/module smoke checks: `mineru-api --help` and `mineru-openai-server --help` (or module equivalents);
+    - fail-fast logging if required runtime deps are missing.
+
+### Task 01 Command-Level Evidence (Dry-Run)
+
+- Local source-module discovery (using local MinerU checkout on `PYTHONPATH`) confirms expected modules are present: `mineru.cli.client`, `mineru.cli.fast_api`, `mineru.cli.vlm_server`.
+- Local startup smoke checks currently fail fast with explicit errors when runtime deps are absent, e.g. `python -m mineru.cli.vlm_server openai_server --help` and `python -m mineru.cli.client --help` return non-zero with `ModuleNotFoundError: No module named 'click'`.
+- This confirms deterministic startup-failure signaling (no silent fallback); downstream tasks must convert this into package-level checks against installed `mineru[vllm]==3.0.7` in `check_dependencies.py`.
 
 ## Files Expected to Change During Implementation
 

@@ -1,10 +1,14 @@
 *
-!test-handler.py
 !handler.py
 !vllm_worker.py
+!vllm_server.py
 !utils.py
 !settings.py
 !check_dependencies.py
+!debug_dependencies.py
 !block_correction_prompts.json
+!mineru.json
 !requirements.txt
+!test-handler.py
+!docker_validation_workflow.py
 !requirements-test.txt

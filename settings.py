@@ -158,34 +158,82 @@ class MinerUSettings(BaseSettings):
     Settings are typically prefixed with 'MINERU_' in environment variables.
 
     Fields:
-        workers (int): Number of worker processes to use for PDF conversion.
-        ocr_mode (str): OCR mode to use ('ocr', 'txt', 'auto').
+        backend (str): MinerU backend for parsing (must be `vlm-http-client`).
+        api_url (Optional[str]): Base URL for remote MinerU API orchestration. If omitted, MinerU starts local API.
+        server_url (str): OpenAI-compatible VLM endpoint used by MinerU HTTP client backend.
+        doc_language (str): MinerU OCR language code (for example `en`, `ch`, `latin`).
+        model_source (str): MinerU model source mode (`local` by default).
+        vl_model_name (str): Request-time model name sent to OpenAI-compatible server.
+        vlm_host (str): Host for local MinerU parsing OpenAI-compatible server startup.
+        vlm_port (int): Port for local MinerU parsing OpenAI-compatible server startup.
+        vlm_model_path (Optional[str]): Optional local model path passed to MinerU OpenAI server startup.
+        server_startup_timeout (int): Timeout in seconds for parsing server readiness.
+        server_health_check_interval (float): Polling interval (seconds) while waiting for readiness.
+        server_ready_check_retries (int): Additional readiness retries after the initial parse server start.
+        server_ready_check_delay (float): Delay in seconds between additional readiness retries.
+        server_shutdown_grace_period (int): Graceful shutdown wait time in seconds for parsing server.
+        server_cooldown_seconds (int): Cooldown after parsing server stop before post-processing server start.
+        ocr_mode (str): OCR mode to use (`ocr`, `txt`, `auto`).
         disable_image_extraction (bool): Do not extract images from documents.
-        page_range (str): Specific pages to process (e.g., "1-5,8").
-        output_format (str): The format of the output (always 'markdown' for MinerU).
-        vram_gb_per_worker (int): The amount of VRAM (in GB) to allocate per worker process.
+        page_range (Optional[str]): Specific pages to process (e.g., `0-5`, `5`).
+        output_format (str): Output format (must be `markdown`).
         debug (bool): Enable debug mode for detailed logging.
-        maxtasksperchild (int): Number of tasks each worker handles before recycling.
-                                This prevents memory leaks and VRAM accumulation.
     """
     model_config = SettingsConfigDict(env_prefix='MINERU_', populate_by_name=True, extra='ignore')
 
-    workers: Optional[int] = Field(None, validation_alias="MINERU_WORKERS")
+    VALID_DOC_LANGUAGES: ClassVar[Set[str]] = {
+        "ch",
+        "ch_lite",
+        "ch_server",
+        "en",
+        "korean",
+        "japan",
+        "chinese_cht",
+        "ta",
+        "te",
+        "ka",
+        "th",
+        "el",
+        "latin",
+        "arabic",
+        "east_slavic",
+        "cyrillic",
+        "devanagari",
+    }
+
+    backend: str = Field("vlm-http-client", validation_alias="MINERU_BACKEND")
+    api_url: Optional[str] = Field(None, validation_alias="MINERU_API_URL")
+    server_url: Optional[str] = Field(None, validation_alias="MINERU_SERVER_URL")
+    doc_language: str = Field("en", validation_alias="MINERU_DOC_LANGUAGE")
+    model_source: str = Field("local", validation_alias="MINERU_MODEL_SOURCE")
+    vl_model_name: str = Field("opendatalab/MinerU2.5-2509-1.2B", validation_alias="MINERU_VL_MODEL_NAME")
+    vlm_host: str = Field("127.0.0.1", validation_alias="MINERU_VLM_HOST")
+    vlm_port: int = Field(30000, validation_alias="MINERU_VLM_PORT")
+    vlm_model_path: Optional[str] = Field(None, validation_alias="MINERU_VLM_MODEL_PATH")
+    server_startup_timeout: int = Field(120, validation_alias="MINERU_VLM_STARTUP_TIMEOUT")
+    server_health_check_interval: float = Field(1.0, validation_alias="MINERU_VLM_HEALTH_CHECK_INTERVAL")
+    server_ready_check_retries: int = Field(2, ge=0, validation_alias="MINERU_VLM_READY_CHECK_RETRIES")
+    server_ready_check_delay: float = Field(2.0, ge=0, validation_alias="MINERU_VLM_READY_CHECK_DELAY")
+    server_shutdown_grace_period: int = Field(15, validation_alias="MINERU_VLM_SHUTDOWN_GRACE_PERIOD")
+    server_cooldown_seconds: int = Field(5, validation_alias="MINERU_VLM_COOLDOWN_SECONDS")
+
     ocr_mode: str = Field("auto", validation_alias="MINERU_OCR_MODE")
     disable_image_extraction: bool = Field(False, validation_alias="MINERU_DISABLE_IMAGE_EXTRACTION")
     page_range: Optional[str] = Field(None, validation_alias="MINERU_PAGE_RANGE")
     output_format: str = Field("markdown", validation_alias="MINERU_OUTPUT_FORMAT")
-    vram_gb_per_worker: int = Field(5, validation_alias="MINERU_VRAM_GB_PER_WORKER")
     debug: bool = Field(False, validation_alias="MINERU_DEBUG")
-    disable_maxtasksperchild: bool = Field(False, validation_alias="MINERU_DISABLE_MAXTASKSPERCHILD")
 
-    # Worker process recycling: Number of tasks each worker handles before being recycled
-    # This helps prevent memory leaks and VRAM accumulation over long-running workers.
-    # Disable it by setting disable_maxtasksperchild to True.
-    maxtasksperchild: Optional[int] = Field(
-        default_factory=lambda data: 25 if data["disable_maxtasksperchild"] is False else None,
-        validation_alias="MINERU_MAXTASKSPERCHILD"
-    )
+    @model_validator(mode='after')
+    def validate_runtime_contract(self) -> 'MinerUSettings':
+        if self.backend != "vlm-http-client":
+            raise ValueError(
+                f"MinerU backend must be 'vlm-http-client' for this runtime path, got '{self.backend}'."
+            )
+
+        if self.server_url is None:
+            self.server_url = f"http://{self.vlm_host}:{self.vlm_port}"
+
+        return self
 
     @field_validator('output_format')
     @classmethod
@@ -194,6 +242,17 @@ class MinerUSettings(BaseSettings):
         if v.lower() != "markdown":
             raise ValueError(f"MinerU only supports 'markdown' output format, got '{v}'")
         return v.lower()
+
+    @field_validator('doc_language')
+    @classmethod
+    def validate_doc_language(cls, value: str) -> str:
+        normalized_value = value.strip().lower()
+        if normalized_value not in cls.VALID_DOC_LANGUAGES:
+            raise ValueError(
+                "doc_language must be one of "
+                f"{sorted(cls.VALID_DOC_LANGUAGES)}, got '{value}'"
+            )
+        return normalized_value
 
 
 class VllmSettings(BaseSettings):

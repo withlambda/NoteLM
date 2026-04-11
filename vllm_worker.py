@@ -23,10 +23,8 @@ API communication for OCR error correction and image description generation.
 import asyncio
 import base64
 import json
-import os
 import logging
 import random
-import signal
 import subprocess
 import threading
 import time
@@ -48,6 +46,7 @@ from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 
 from settings import VllmSettings
 from utils import ImageTokenCalculator
+from vllm_server import VllmServerManager, VllmServerRoleConfig
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -70,7 +69,7 @@ class VllmWorker:
     OpenAI-compatible REST API using the ``openai`` Python client.
     """
 
-    def __init__(self, settings: VllmSettings) -> None:
+    def __init__(self, settings: VllmSettings, server_manager: Optional[VllmServerManager] = None) -> None:
         """
         Initialize the VllmWorker.
 
@@ -81,6 +80,9 @@ class VllmWorker:
         self.process: Optional[subprocess.Popen] = None
         self._client: Optional[openai.AsyncOpenAI] = None
         self._restart_attempted: bool = False
+        self._postprocess_role = "notelm_postprocess"
+        self.server_manager = server_manager or VllmServerManager()
+        self.server_manager.set_role_config(self._build_role_config())
 
         self.image_token_calculator = ImageTokenCalculator(
             model_path=self.settings.vllm_model_path,
@@ -136,8 +138,12 @@ class VllmWorker:
         Raises:
             RuntimeError: If the server fails to start or the health check times out.
         """
+        self.server_manager.set_role_config(self._build_role_config())
+        managed_process = self.server_manager.get_process(self._postprocess_role)
+
         # If already running, nothing to do
-        if self.process is not None and self.process.poll() is None:
+        if managed_process is not None:
+            self.process = managed_process
             logger.info("vLLM server is already running.")
             return
 
@@ -146,39 +152,11 @@ class VllmWorker:
             logger.warning("vLLM server process was found dead. Cleaning up before restart.")
             self._cleanup_process()
 
-        # --- VRAM Recovery Phase ---
         delay = vram_recovery_delay if vram_recovery_delay is not None else self.settings.vllm_vram_recovery_delay
-        if delay > 0:
-            logger.info(f"Waiting {delay}s for GPU VRAM recovery before starting vLLM...")
-            time.sleep(delay)
-
-        # --- Build CLI command ---
         cmd = self._build_serve_command()
         logger.info(f"Starting vLLM server: {' '.join(cmd)}")
-
-        # --- Launch subprocess ---
-        env = os.environ.copy()
-
-        # Forces fresh CUDA initialization in the child
-        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        # Critical if MinerU used the GPU earlier
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-        if self.settings.vllm_cpu:
-            env["VLLM_TARGET_DEVICE"] = "cpu"
-
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            start_new_session=True,
-        )
+        self.process = self.server_manager.start(self._postprocess_role, startup_delay=float(delay))
         logger.info(f"vLLM subprocess started (PID {self.process.pid})")
-
-        # --- Health-check polling ---
-        self._wait_for_ready()
 
         # --- Create OpenAI client ---
         self._client = openai.AsyncOpenAI(
@@ -195,29 +173,19 @@ class VllmWorker:
         Sends SIGTERM, waits up to ``vllm_shutdown_grace_period`` seconds,
         then sends SIGKILL if the process is still running.
         """
-        if self.process is None:
+        process = self.server_manager.get_process(self._postprocess_role)
+        if process is None and self.process is None:
             return
 
-        pid = self.process.pid
-        shutdown_grace_period = self.settings.vllm_shutdown_grace_period
+        if process is not None:
+            self.process = process
+
+        pid = self.process.pid if self.process is not None else "unknown"
         logger.info(f"Stopping vLLM server (PID {pid})...")
 
         try:
-            # Send SIGTERM for graceful shutdown
-            self.process.send_signal(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=shutdown_grace_period)
-                logger.info(f"vLLM server (PID {pid}) terminated gracefully.")
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"vLLM server (PID {pid}) did not exit within {shutdown_grace_period}s. "
-                    f"Sending SIGKILL..."
-                )
-                self.process.kill()
-                self.process.wait(timeout=5)
-                logger.info(f"vLLM server (PID {pid}) killed.")
-        except ProcessLookupError:
-            logger.info(f"vLLM server (PID {pid}) already exited.")
+            self.server_manager.stop(self._postprocess_role)
+            logger.info(f"vLLM server (PID {pid}) terminated.")
         except Exception as e:
             logger.error(f"Error stopping vLLM server (PID {pid}): {e}")
         finally:
@@ -866,6 +834,26 @@ class VllmWorker:
             cmd.extend(["--served-model-name", self.settings.vllm_model])
 
         return cmd
+
+    def _build_role_config(self) -> VllmServerRoleConfig:
+        environment = {
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        }
+
+        if self.settings.vllm_cpu:
+            environment["VLLM_TARGET_DEVICE"] = "cpu"
+
+        return VllmServerRoleConfig(
+            role=self._postprocess_role,
+            command=self._build_serve_command(),
+            host=self.settings.vllm_host,
+            port=self.settings.vllm_port,
+            startup_timeout=self.settings.vllm_startup_timeout,
+            health_check_interval=self.settings.vllm_health_check_interval,
+            shutdown_grace_period=self.settings.vllm_shutdown_grace_period,
+            environment=environment,
+        )
 
     def _wait_for_ready(self) -> None:
         """
