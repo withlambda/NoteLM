@@ -229,7 +229,7 @@ def _parse_mineru_page_range(page_range: Optional[str]) -> Tuple[int, Optional[i
 
 def mineru_process_single_file(
     file_path: Path,
-    mineru_config_dict: Dict[str, Any],
+    disable_image_extraction: bool,
     output_base_path: Path,
 ) -> Tuple[bool, Optional[Path]]:
     """
@@ -237,7 +237,7 @@ def mineru_process_single_file(
 
     Args:
         file_path (Path): Path to the input file (e.g., .pdf).
-        mineru_config_dict (Dict[str, Any]): Configuration for the MinerU converter.
+        disable_image_extraction (bool): Whether to disable image extraction.
         output_base_path (Path): The root directory where output for this file will be saved.
 
     Returns:
@@ -250,8 +250,6 @@ def mineru_process_single_file(
         file_stem = file_path.stem
         out_folder = Path(output_base_path) / file_stem
         out_folder.mkdir(parents=True, exist_ok=True)
-
-        disable_images = mineru_config_dict.get("disable_image_extraction", False)
 
         # --- Normalize Output ---
         # MinerU often creates a subfolder named after the stem inside our out_folder
@@ -278,7 +276,7 @@ def mineru_process_single_file(
             target_images = out_folder / "images"
 
             if source_images.exists() and source_images.is_dir():
-                if disable_images:
+                if disable_image_extraction:
                     # If image extraction is disabled, remove the images
                     shutil.rmtree(source_images)
                 else:
@@ -472,14 +470,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     os.makedirs(output_path, exist_ok=True)
 
-    # --- Configure MinerU ---
-    mineru_config = {
-        "ocr_mode": mineru_settings.ocr_mode,
-        "disable_image_extraction": mineru_settings.disable_image_extraction,
-        "page_range": mineru_settings.page_range,
-        "debug": mineru_settings.debug,
-    }
-
     logger.info("--- Processing Job ---")
     logger.info(f"Input Path: {input_path}")
     logger.info(f"Output Path: {output_path}")
@@ -569,7 +559,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         for file_to_process in files_to_process:
             success, output_file_path = mineru_process_single_file(
                 file_to_process,
-                mineru_config,
+                mineru_settings.disable_image_extraction,
                 output_path,
             )
             if success and output_file_path:
@@ -592,7 +582,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- 3. vLLM LLM Post-processing (Parallel) ---
     failed_post_processing = []
-    if app_config.use_postprocess_llm and vllm_worker and processed_files:
+    if (app_config.use_postprocess_llm
+        and (
+            vllm_settings.vllm_enable_postprocess_ocr_error_correction
+            or vllm_settings.vllm_enable_postprocess_image_to_text_descriptions
+        )
+        and vllm_worker
+        and processed_files
+    ):
         server_manager.handoff(
             parse_role=parse_server_role,
             post_role="notelm_postprocess",
@@ -612,49 +609,51 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
                 # Process files sequentially, with parallel chunk processing within each file
                 for processed_file_path in processed_files:
-                    success = vllm_worker.process_file(
-                        file_path=processed_file_path,
-                        prompt_template=vllm_settings.vllm_block_correction_prompt,
-                        max_chunk_workers=vllm_settings.vllm_chunk_workers
-                    )
-
-                    if not success:
-                        failed_post_processing.append(processed_file_path.name)
-                        continue
-
-                    # Language Inference for Image Descriptions and Localized Markers
-                    with open(processed_file_path, 'r', encoding=app_config.FILE_ENCODING) as f:
-                        text_sample = f.read(app_config.LANGUAGE_DETECTION_SAMPLE_SIZE)
-                    target_lang_code = LanguageProcessor.infer_output_language(text_sample)
-                    target_lang_name = LanguageProcessor.resolve_language_name(target_lang_code)
-                    logger.info(f"Inferred target language for {processed_file_path.name}: {target_lang_name} ({target_lang_code})")
-
-                    extracted_images = list_extracted_images_for_output_file(app_config, processed_file_path)
-                    if not extracted_images:
-                        continue
-
-                    image_descriptions = vllm_worker.describe_images(
-                        image_paths=extracted_images,
-                        prompt_template=vllm_settings.vllm_image_description_prompt,
-                        max_image_workers=vllm_settings.vllm_chunk_workers,
-                        target_language=target_lang_name
-                    )
-
-                    # Resolve localized labels for the inferred language
-                    localized_labels = LanguageProcessor.resolve_image_description_labels(target_lang_code, app_config)
-
-                    inserted_descriptions = insert_image_descriptions_to_text_file(
-                        app_config=app_config,
-                        output_file_path=processed_file_path,
-                        image_descriptions=image_descriptions,
-                        heading_override=localized_labels["begin_marker"],
-                        end_override=localized_labels["end_marker"],
-                        section_heading_override=localized_labels["section_heading"]
-                    )
-                    if inserted_descriptions:
-                        logger.info(
-                            f"Inserted {len(image_descriptions)} image descriptions into {processed_file_path.name}"
+                    if vllm_settings.vllm_enable_postprocess_ocr_error_correction:
+                        success = vllm_worker.process_file(
+                            file_path=processed_file_path,
+                            prompt_template=vllm_settings.vllm_block_correction_prompt,
+                            max_chunk_workers=vllm_settings.vllm_chunk_workers
                         )
+
+                        if not success:
+                            failed_post_processing.append(processed_file_path.name)
+                            continue
+
+                    if vllm_settings.vllm_enable_postprocess_image_to_text_descriptions:
+                        # Language Inference for Image Descriptions and Localized Markers
+                        with open(processed_file_path, 'r', encoding=app_config.FILE_ENCODING) as f:
+                            text_sample = f.read(app_config.LANGUAGE_DETECTION_SAMPLE_SIZE)
+                        target_lang_code = LanguageProcessor.infer_output_language(text_sample)
+                        target_lang_name = LanguageProcessor.resolve_language_name(target_lang_code)
+                        logger.info(f"Inferred target language for {processed_file_path.name}: {target_lang_name} ({target_lang_code})")
+
+                        extracted_images = list_extracted_images_for_output_file(app_config, processed_file_path)
+                        if not extracted_images:
+                            continue
+
+                        image_descriptions = vllm_worker.describe_images(
+                            image_paths=extracted_images,
+                            prompt_template=vllm_settings.vllm_image_description_prompt,
+                            max_image_workers=vllm_settings.vllm_chunk_workers,
+                            target_language=target_lang_name
+                        )
+
+                        # Resolve localized labels for the inferred language
+                        localized_labels = LanguageProcessor.resolve_image_description_labels(target_lang_code, app_config)
+
+                        inserted_descriptions = insert_image_descriptions_to_text_file(
+                            app_config=app_config,
+                            output_file_path=processed_file_path,
+                            image_descriptions=image_descriptions,
+                            heading_override=localized_labels["begin_marker"],
+                            end_override=localized_labels["end_marker"],
+                            section_heading_override=localized_labels["section_heading"]
+                        )
+                        if inserted_descriptions:
+                            logger.info(
+                                f"Inserted {len(image_descriptions)} image descriptions into {processed_file_path.name}"
+                            )
 
             torch.cuda.empty_cache()
             log_vram_usage("Final")
