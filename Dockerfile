@@ -99,4 +99,5 @@ RUN groupadd -r appgroup && useradd -r -g appgroup -u 1001 -m -d /home/appuser a
 USER appuser
 
 # 10. START COMMAND
-CMD python3 -u  "${HANDLER_FILE_NAME}"
+ENTRYPOINT []
+CMD ["sh", "-c", "python3 -u \"${HANDLER_FILE_NAME}\""]
