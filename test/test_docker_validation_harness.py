@@ -18,6 +18,14 @@ class TestDockerValidationHarness(unittest.TestCase):
         self.assertIn("-v \"${RESULTS_DIR}:/v/results\"", content)
         self.assertIn("python3 -u docker_validation_workflow.py", content)
 
+    def test_dockerfile_resets_base_entrypoint_before_python_command(self):
+        dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
+        content = dockerfile.read_text(encoding="utf-8")
+
+        self.assertIn('HANDLER_FILE_NAME="handler.py"', content)
+        self.assertIn("ENTRYPOINT []", content)
+        self.assertIn('CMD ["sh", "-c", "python3 -u \\\"${HANDLER_FILE_NAME}\\\""]', content)
+
 
 if __name__ == "__main__":
     unittest.main()
