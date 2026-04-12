@@ -416,7 +416,7 @@ class VllmSettings(BaseSettings):
     )
 
     vllm_chunk_user_prompt_init_end: str = Field(
-        "\n### CORRECTED TEXT:",
+        "\n\n### CORRECTED TEXT:",
         validation_alias="NOTELM_VLLM_CHUNK_USER_PROMPT_INIT_END"
     )
 
@@ -429,9 +429,13 @@ class VllmSettings(BaseSettings):
         """
         Structural & Markdown Rules:
             - Metadata Preservation:
-                - Do NOT alter page markers like {0}-----------------
-                - Keep image syntax like ![](_page_1_Picture_5.jpeg) exactly as is.
+                - Do NOT alter page markers like {0}----------------. Keep the exact number inside the brackets as found in the input.-
+                - Image Syntax: Preserve image references (e.g., ![](...)) exactly as they appear in the source text. Do NOT change the filename or path.
             - Hyphenation: Merge words split by line-break hyphens unless the hyphen is part of the archaic compound style.
+        Output Format
+            - Start your response immediately with the corrected text.
+            - Do NOT repeat the input text, do not add labels like "Corrected Version:"
+            - Do not add any introductory or concluding remarks.
         """,
         validation_alias="NOTELM_VLLM_CHUNK_STRUCTURAL_MARKDOWN_INSTRUCTIONS"
     )
